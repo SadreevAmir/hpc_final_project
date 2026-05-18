@@ -1,0 +1,5 @@
+build/
+bin/
+artifacts/
+
+*.o

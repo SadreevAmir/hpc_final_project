@@ -84,7 +84,7 @@ struct Cfg {
 // All trainable parameters live in ONE flat device buffer of size sum(param_sizes).
 // `param_ptrs[i]` is the pointer at which tensor `i` begins inside that buffer.
 // Same scheme for activations and their gradients. This lets us reduce the
-// whole gradient blob with a single ncclAllReduce and run a single SGD kernel
+// whole gradient blob with a single ncclAllReduce and run a single Adam kernel
 // over every parameter at once.
 // =============================================================================
 
@@ -611,21 +611,25 @@ __global__ void softmax_ce_backward(
 }
 
 // -----------------------------------------------------------------------------
-// SGD with momentum. Operates on the whole flat parameter buffer at once.
-//   m <- momentum * m + g * scale
-//   w <- w - lr * m
+// ADAM
 // scale = 1 / (B * world)  so that after NCCL allreduce the gradient is the
 // mean over the global batch.
 // -----------------------------------------------------------------------------
-__global__ void sgd_step(
-    float *w, const float *g, float *m,
-    int n, float lr, float momentum, float scale)
+// bc1 = 1 - beta1^step, bc2 = 1 - beta2^step — вычисляются на CPU
+// чтобы не дублировать powf() в каждой из total_params нитей.
+__global__ void adam_step(
+    float *w, const float *g, float *m, float *v,
+    int n, float lr, float beta1, float beta2, float eps,
+    float scale, float bc1, float bc2)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float new_m = momentum * m[i] + g[i] * scale;
-    m[i]  = new_m;
-    w[i] -= lr * new_m;
+    float gi = g[i] * scale;
+    float mi = beta1 * m[i] + (1.0f - beta1) * gi;
+    float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+    w[i] -= lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
 }
 
 // -----------------------------------------------------------------------------
@@ -1027,11 +1031,13 @@ int main(int argc, char **argv)
     for (int i = 0; i < NUM_PARAMS; i++) total_params += param_sz[i];
     for (int i = 0; i < NUM_ACTS;   i++) total_acts   += act_sz[i];
 
-    float *d_params, *d_grads, *d_momentum;
+    float *d_params, *d_grads, *d_momentum, *d_velocity;
     CHECK(cudaMalloc(&d_params,   total_params * sizeof(float)));
     CHECK(cudaMalloc(&d_grads,    total_params * sizeof(float)));
     CHECK(cudaMalloc(&d_momentum, total_params * sizeof(float)));
+    CHECK(cudaMalloc(&d_velocity, total_params * sizeof(float)));
     CHECK(cudaMemset(d_momentum, 0, total_params * sizeof(float)));
+    CHECK(cudaMemset(d_velocity, 0, total_params * sizeof(float)));
 
     float *d_acts, *d_dacts;
     CHECK(cudaMalloc(&d_acts,  total_acts * sizeof(float)));
@@ -1065,6 +1071,15 @@ int main(int argc, char **argv)
                world, N, B, cfg.seq, cfg.layers, cfg.dim, cfg.heads,
                cfg.classes, total_params, steps, lr);
         fflush(stdout);
+    }
+
+    FILE *log_fp = NULL;
+    if (rank == 0) {
+        log_fp = fopen("training_log.csv", "w");
+        if (log_fp) {
+            fprintf(log_fp, "step,elapsed_s,loss,accuracy\n");
+            fflush(log_fp);
+        }
     }
 
     // Each rank samples its own random batches.
@@ -1102,11 +1117,13 @@ int main(int argc, char **argv)
             CHECK(ncclAllReduce(d_grads, d_grads, total_params,
                                 ncclFloat, ncclSum, nccl, stream));
 
-        // SGD over the entire flat parameter buffer in one launch.
+        // Adam over the entire flat parameter buffer in one launch.
         float scale = 1.0f / (float)(B * world);
-        sgd_step<<<GRID((int)total_params), 0, stream>>>(
-            d_params, d_grads, d_momentum,
-            (int)total_params, lr, /*momentum*/ 0.9f, scale);
+        float bc1   = 1.0f - powf(0.9f,   (float)step);
+        float bc2   = 1.0f - powf(0.999f, (float)step);
+        adam_step<<<GRID((int)total_params), 0, stream>>>(
+            d_params, d_grads, d_momentum, d_velocity,
+            (int)total_params, lr, 0.9f, 0.999f, 1e-8f, scale, bc1, bc2);
 
         // Periodic loss + accuracy.
         if (step % 10 == 0 || step == steps) {
@@ -1131,9 +1148,18 @@ int main(int argc, char **argv)
             MPI_Allreduce(MPI_IN_PLACE, &global_n,    1, MPI_INT,
                           MPI_SUM, MPI_COMM_WORLD);
             mean_loss /= world;
-            if (rank == 0)
+            if (rank == 0) {
+                double el = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
                 printf("step %4d | loss %.4f | acc %.3f\n",
                        step, mean_loss, (float)global_corr / global_n);
+                if (log_fp) {
+                    fprintf(log_fp, "%d,%.2f,%.4f,%.4f\n",
+                            step, el, mean_loss,
+                            (float)global_corr / global_n);
+                    fflush(log_fp);
+                }
+            }
         }
     }
     CHECK(cudaStreamSynchronize(stream));
@@ -1148,10 +1174,11 @@ int main(int argc, char **argv)
                total_images / elapsed, total_images / elapsed / world);
     }
 
+    if (log_fp) fclose(log_fp);
     cudaFreeHost(h_pixel); cudaFreeHost(h_target);
     cudaFree(d_pixel);     cudaFree(d_target);
     cudaFree(d_acts);      cudaFree(d_dacts);
-    cudaFree(d_params);    cudaFree(d_grads); cudaFree(d_momentum);
+    cudaFree(d_params);    cudaFree(d_grads); cudaFree(d_momentum); cudaFree(d_velocity);
     cudaFree(d_loss_sum);  cudaFree(d_correct);
     ncclCommDestroy(nccl);
     cublasDestroy(cublas);

@@ -16,3 +16,6 @@ roofline.png
 timing*.png
 hbm*.png
 timing_kernels*.png
+torch*.png
+torch*.csv
+training_log_torch.csv

@@ -178,6 +178,43 @@ def sync_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+class StepTimer:
+    """Per-step latency breakdown matching train_vit.cu's coarse CUDA events.
+
+    Sections: h2d, fwd, bwd, nccl, adam. On CUDA every boundary is a cuda
+    event (async-safe); on CPU a perf_counter timestamp.
+    """
+
+    SECTIONS = ("h2d", "fwd", "bwd", "nccl", "adam")
+
+    def __init__(self, device: torch.device) -> None:
+        self.cuda = device.type == "cuda"
+        if self.cuda:
+            self._events = {
+                name: torch.cuda.Event(enable_timing=True)
+                for name in ("step0", *self.SECTIONS)
+            }
+        else:
+            self._marks: dict[str, float] = {}
+
+    def mark(self, name: str) -> None:
+        if self.cuda:
+            self._events[name].record()
+        else:
+            self._marks[name] = time.perf_counter()
+
+    def elapsed_ms(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        prev = "step0"
+        for name in self.SECTIONS:
+            if self.cuda:
+                out[name] = self._events[prev].elapsed_time(self._events[name])
+            else:
+                out[name] = (self._marks[name] - self._marks[prev]) * 1000.0
+            prev = name
+        return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PyTorch MNIST pixel-token ViT counterpart for train_vit.cu.",
@@ -249,7 +286,10 @@ def main() -> None:
             )
             log_fp = Path(args.log_path).open("w", newline="")
             log_writer = csv.writer(log_fp)
-            log_writer.writerow(("step", "elapsed_s", "loss", "accuracy"))
+            log_writer.writerow((
+                "step", "elapsed_s", "loss", "accuracy",
+                "t_h2d_ms", "t_fwd_ms", "t_bwd_ms", "t_nccl_ms", "t_adam_ms",
+            ))
             log_fp.flush()
         else:
             log_writer = None
@@ -257,28 +297,51 @@ def main() -> None:
         sync_device(device)
         start = time.perf_counter()
         train_model.train()
+        timer = StepTimer(device)
 
         for step, (pixels, labels) in enumerate(loader, start=1):
+            timer.mark("step0")
             pixels = pixels.to(device=device, dtype=torch.long, non_blocking=True)
             labels = labels.to(device=device, non_blocking=True)
+            timer.mark("h2d")
 
             optimizer.zero_grad(set_to_none=True)
             logits = train_model(pixels)
             loss = F.cross_entropy(logits, labels)
+            timer.mark("fwd")
+
             loss.backward()
+            timer.mark("bwd")
+
+            # DDP all-reduces gradients during backward(); no separate phase
+            # to time, so t_nccl is ~0 (folded into t_bwd).
+            timer.mark("nccl")
+
             optimizer.step()
+            timer.mark("adam")
 
             should_log = step % args.log_every == 0 or step == args.steps
             if should_log:
                 mean_loss, accuracy = reduce_metrics(loss, logits, labels, world)
                 if rank == 0:
                     sync_device(device)
+                    splits = timer.elapsed_ms()
                     elapsed = time.perf_counter() - start
-                    print(f"step {step:4d} | loss {mean_loss:.4f} | acc {accuracy:.3f}", flush=True)
+                    print(
+                        f"step {step:4d} | loss {mean_loss:.4f} | acc {accuracy:.3f} | "
+                        f"h2d {splits['h2d']:.2f} fwd {splits['fwd']:.2f} "
+                        f"bwd {splits['bwd']:.2f} nccl {splits['nccl']:.2f} "
+                        f"adam {splits['adam']:.2f} ms",
+                        flush=True,
+                    )
                     if log_writer is not None and log_fp is not None:
-                        log_writer.writerow(
-                            (step, f"{elapsed:.2f}", f"{mean_loss:.4f}", f"{accuracy:.4f}")
-                        )
+                        log_writer.writerow((
+                            step, f"{elapsed:.2f}", f"{mean_loss:.4f}",
+                            f"{accuracy:.4f}",
+                            f"{splits['h2d']:.3f}", f"{splits['fwd']:.3f}",
+                            f"{splits['bwd']:.3f}", f"{splits['nccl']:.3f}",
+                            f"{splits['adam']:.3f}",
+                        ))
                         log_fp.flush()
 
         sync_device(device)

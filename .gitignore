@@ -1,5 +1,16 @@
+run.ipynb
+data/
 build/
 bin/
 artifacts/
-
+__pycache__/
+*.pyc
 *.o
+training_log.csv
+1gpu_log.csv
+2gpu_log.csv
+training_curves.png
+profiling*.png
+pcie*.png
+nccl*.png
+roofline.png

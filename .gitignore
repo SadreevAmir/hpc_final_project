@@ -1,4 +1,3 @@
-run.ipynb
 data/
 build/
 bin/
@@ -14,3 +13,4 @@ profiling*.png
 pcie*.png
 nccl*.png
 roofline.png
+timing*.png

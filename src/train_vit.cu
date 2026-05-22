@@ -1077,7 +1077,7 @@ int main(int argc, char **argv)
     if (rank == 0) {
         log_fp = fopen("training_log.csv", "w");
         if (log_fp) {
-            fprintf(log_fp, "step,elapsed_s,loss,accuracy\n");
+            fprintf(log_fp, "step,elapsed_s,loss,accuracy,t_h2d_ms,t_fwd_ms,t_bwd_ms,t_nccl_ms,t_adam_ms\n");
             fflush(log_fp);
         }
     }
@@ -1085,6 +1085,14 @@ int main(int argc, char **argv)
     // Each rank samples its own random batches.
     std::mt19937 rng(42 + 1000u * rank);
     std::uniform_int_distribution<int> sampler(0, N - 1);
+
+    cudaEvent_t ev_step0, ev_h2d, ev_fwd, ev_bwd, ev_nccl, ev_adam;
+    CHECK(cudaEventCreate(&ev_step0));
+    CHECK(cudaEventCreate(&ev_h2d));
+    CHECK(cudaEventCreate(&ev_fwd));
+    CHECK(cudaEventCreate(&ev_bwd));
+    CHECK(cudaEventCreate(&ev_nccl));
+    CHECK(cudaEventCreate(&ev_adam));
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -1096,10 +1104,12 @@ int main(int argc, char **argv)
             for (int t = 0; t < cfg.seq; t++)
                 h_pixel[b*cfg.seq + t] = (int)pixels[(size_t)j*cfg.seq + t];
         }
+        cudaEventRecord(ev_step0, stream);
         CHECK(cudaMemcpyAsync(d_pixel,  h_pixel,  BT*sizeof(int),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaMemcpyAsync(d_target, h_target, B *sizeof(int),
                               cudaMemcpyHostToDevice, stream));
+        cudaEventRecord(ev_h2d, stream);
 
         // Zero gradient buffers (param-grads accumulate via atomicAdd for some
         // tensors; activation-grads are partly accumulated via residual stream).
@@ -1109,13 +1119,16 @@ int main(int argc, char **argv)
         model_forward(params, acts, d_pixel, cfg, B, cublas, stream);
         softmax_ce_forward<<<B, 32, 0, stream>>>(
             acts[A_PROBS], acts[A_LOSSES], acts[A_LOGITS], d_target, B, cfg.classes);
+        cudaEventRecord(ev_fwd, stream);
         model_backward(params, grads, acts, dacts,
                        d_pixel, d_target, cfg, B, cublas, stream);
+        cudaEventRecord(ev_bwd, stream);
 
         // Reduce gradients across ranks (no-op for world == 1).
         if (world > 1)
             CHECK(ncclAllReduce(d_grads, d_grads, total_params,
                                 ncclFloat, ncclSum, nccl, stream));
+        cudaEventRecord(ev_nccl, stream);
 
         // Adam over the entire flat parameter buffer in one launch.
         float scale = 1.0f / (float)(B * world);
@@ -1124,6 +1137,7 @@ int main(int argc, char **argv)
         adam_step<<<GRID((int)total_params), 0, stream>>>(
             d_params, d_grads, d_momentum, d_velocity,
             (int)total_params, lr, 0.9f, 0.999f, 1e-8f, scale, bc1, bc2);
+        cudaEventRecord(ev_adam, stream);
 
         // Periodic loss + accuracy.
         if (step % 10 == 0 || step == steps) {
@@ -1139,6 +1153,13 @@ int main(int argc, char **argv)
                                   cudaMemcpyDeviceToHost, stream));
             CHECK(cudaStreamSynchronize(stream));
 
+            float t_h2d_ms = 0, t_fwd_ms = 0, t_bwd_ms = 0, t_nccl_ms = 0, t_adam_ms = 0;
+            cudaEventElapsedTime(&t_h2d_ms,  ev_step0, ev_h2d);
+            cudaEventElapsedTime(&t_fwd_ms,  ev_h2d,   ev_fwd);
+            cudaEventElapsedTime(&t_bwd_ms,  ev_fwd,   ev_bwd);
+            cudaEventElapsedTime(&t_nccl_ms, ev_bwd,   ev_nccl);
+            cudaEventElapsedTime(&t_adam_ms, ev_nccl,  ev_adam);
+
             float mean_loss   = h_loss / B;
             int   global_corr = h_corr, global_n = B;
             MPI_Allreduce(MPI_IN_PLACE, &mean_loss,   1, MPI_FLOAT,
@@ -1151,12 +1172,14 @@ int main(int argc, char **argv)
             if (rank == 0) {
                 double el = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
-                printf("step %4d | loss %.4f | acc %.3f\n",
-                       step, mean_loss, (float)global_corr / global_n);
+                printf("step %4d | loss %.4f | acc %.3f | h2d %.2fms fwd %.2fms bwd %.2fms nccl %.2fms adam %.2fms\n",
+                       step, mean_loss, (float)global_corr / global_n,
+                       t_h2d_ms, t_fwd_ms, t_bwd_ms, t_nccl_ms, t_adam_ms);
                 if (log_fp) {
-                    fprintf(log_fp, "%d,%.2f,%.4f,%.4f\n",
+                    fprintf(log_fp, "%d,%.2f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                             step, el, mean_loss,
-                            (float)global_corr / global_n);
+                            (float)global_corr / global_n,
+                            t_h2d_ms, t_fwd_ms, t_bwd_ms, t_nccl_ms, t_adam_ms);
                     fflush(log_fp);
                 }
             }
@@ -1175,6 +1198,9 @@ int main(int argc, char **argv)
     }
 
     if (log_fp) fclose(log_fp);
+    cudaEventDestroy(ev_step0); cudaEventDestroy(ev_h2d);
+    cudaEventDestroy(ev_fwd);   cudaEventDestroy(ev_bwd);
+    cudaEventDestroy(ev_nccl);  cudaEventDestroy(ev_adam);
     cudaFreeHost(h_pixel); cudaFreeHost(h_target);
     cudaFree(d_pixel);     cudaFree(d_target);
     cudaFree(d_acts);      cudaFree(d_dacts);

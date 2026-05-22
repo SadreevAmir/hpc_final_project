@@ -320,30 +320,6 @@ __global__ void bias_grad(float *db, const float *dy, int N, int K)
     db[k] = s;
 }
 
-__device__ __forceinline__ size_t qkv_offset(
-    int b, int t, int which, int h, int T, int D, int head_dim)
-{
-    return ((size_t)b * T + t) * 3 * D + which * D + h * head_dim;
-}
-
-__global__ void attention_qk(
-    float *scores, const float *qkv,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * H * T * T) return;
-    int b  =  i / (H * T * T);
-    int h  = (i / (T * T)) % H;
-    int t1 = (i / T) % T;
-    int t2 =  i % T;
-    const float *q = qkv + qkv_offset(b, t1, 0, h, T, D, head_dim);
-    const float *k = qkv + qkv_offset(b, t2, 1, h, T, D, head_dim);
-
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; d++) dot += q[d] * k[d];
-    scores[i] = dot * rsqrtf((float)head_dim);
-}
-
 __global__ void attention_softmax(
     float *attn, const float *scores, int B, int H, int T)
 {
@@ -365,68 +341,6 @@ __global__ void attention_softmax(
         attn_row[t] = expf(score_row[t] - mx) * inv;
 }
 
-__global__ void attention_av(
-    float *out, const float *attn, const float *qkv,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * T * D) return;
-    int b  =  i / (T * D);
-    int t1 = (i / D) % T;
-    int hd =  i % D;
-    int h  = hd / head_dim;
-    int di = hd % head_dim;
-
-    float sum = 0.0f;
-    for (int t2 = 0; t2 < T; t2++) {
-        float a = attn[((size_t)b * H + h) * T * T + (size_t)t1 * T + t2];
-        float v = qkv[qkv_offset(b, t2, 2, h, T, D, head_dim) + di];
-        sum += a * v;
-    }
-    out[i] = sum;
-}
-
-__global__ void attention_dv(
-    float *dqkv, const float *attn, const float *d_out,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * T * D) return;
-    int b  =  i / (T * D);
-    int t2 = (i / D) % T;
-    int hd =  i % D;
-    int h  = hd / head_dim;
-    int di = hd % head_dim;
-
-    float sum = 0.0f;
-    for (int t1 = 0; t1 < T; t1++) {
-        float a   = attn[((size_t)b * H + h) * T * T + (size_t)t1 * T + t2];
-        float dyx = d_out[((size_t)b * T + t1) * D + h * head_dim + di];
-        sum += a * dyx;
-    }
-    dqkv[qkv_offset(b, t2, 2, h, T, D, head_dim) + di] = sum;
-}
-
-__global__ void attention_d_attn(
-    float *d_attn, const float *qkv, const float *d_out,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * H * T * T) return;
-    int b  =  i / (H * T * T);
-    int h  = (i / (T * T)) % H;
-    int t1 = (i / T) % T;
-    int t2 =  i % T;
-
-    float sum = 0.0f;
-    for (int d = 0; d < head_dim; d++) {
-        float v   = qkv[qkv_offset(b, t2, 2, h, T, D, head_dim) + d];
-        float dyx = d_out[((size_t)b * T + t1) * D + h * head_dim + d];
-        sum += v * dyx;
-    }
-    d_attn[i] = sum;
-}
-
 __global__ void attention_d_softmax(
     float *d_scores, const float *d_attn, const float *attn,
     int B, int H, int T)
@@ -445,47 +359,7 @@ __global__ void attention_d_softmax(
         out_row[t] = attn_row[t] * (d_attn_row[t] - s);
 }
 
-__global__ void attention_dq(
-    float *dqkv, const float *d_scores, const float *qkv,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * T * D) return;
-    int b  =  i / (T * D);
-    int t1 = (i / D) % T;
-    int hd =  i % D;
-    int h  = hd / head_dim;
-    int di = hd % head_dim;
 
-    float sum = 0.0f;
-    for (int t2 = 0; t2 < T; t2++) {
-        float ds = d_scores[((size_t)b * H + h) * T * T + (size_t)t1 * T + t2];
-        float k  = qkv[qkv_offset(b, t2, 1, h, T, D, head_dim) + di];
-        sum += k * ds;
-    }
-    dqkv[qkv_offset(b, t1, 0, h, T, D, head_dim) + di] = sum * rsqrtf((float)head_dim);
-}
-
-__global__ void attention_dk(
-    float *dqkv, const float *d_scores, const float *qkv,
-    int B, int T, int H, int D, int head_dim)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * T * D) return;
-    int b  =  i / (T * D);
-    int t2 = (i / D) % T;
-    int hd =  i % D;
-    int h  = hd / head_dim;
-    int di = hd % head_dim;
-
-    float sum = 0.0f;
-    for (int t1 = 0; t1 < T; t1++) {
-        float ds = d_scores[((size_t)b * H + h) * T * T + (size_t)t1 * T + t2];
-        float q  = qkv[qkv_offset(b, t1, 0, h, T, D, head_dim) + di];
-        sum += q * ds;
-    }
-    dqkv[qkv_offset(b, t2, 1, h, T, D, head_dim) + di] = sum * rsqrtf((float)head_dim);
-}
 
 #define GELU_K 0.7978845608f
 
@@ -676,13 +550,37 @@ static void model_forward(
             BT, D, 3*D, cublas, stream);
         if (fwd_ev) cudaEventRecord(fwd_ev[base + 1], stream);  // qkv
 
-        attention_qk<<<GRID(BHTT), 0, stream>>>(
-            acts[A_ATTN_PRE] + l*BHTT, acts[A_QKV] + l*BT3D, B, T, H, D, HD);
-        attention_softmax<<<B*H*T, 32, 0, stream>>>(
-            acts[A_ATTN] + l*BHTT, acts[A_ATTN_PRE] + l*BHTT, B, H, T);
-        attention_av<<<GRID(BTD), 0, stream>>>(
-            acts[A_ATTN_OUT] + l*BTD, acts[A_ATTN] + l*BHTT,
-            acts[A_QKV] + l*BT3D, B, T, H, D, HD);
+        // Q @ K^T  (cublasSgemmStridedBatched per batch element, H heads each)
+        // Layout: Q[b,h] = qkv + b*T*3D + h*HD  — col-major [HD,T] lda=3D stride=HD
+        //         S[b,h] = scores + b*H*T*T      — [T,T] ldc=T strideC=T*T
+        {
+            float alpha_qk = 1.0f / sqrtf((float)HD), beta0 = 0.0f;
+            float       *qkv_l = acts[A_QKV]      + (size_t)l * BT3D;
+            float       *pre_l = acts[A_ATTN_PRE] + (size_t)l * BHTT;
+            float       *attn_l= acts[A_ATTN]     + (size_t)l * BHTT;
+            float       *out_l = acts[A_ATTN_OUT] + (size_t)l * BTD;
+            for (int b = 0; b < B; b++) {
+                const float *Q_b = qkv_l + (size_t)b * T * 3 * D;
+                const float *K_b = Q_b + D;
+                float       *S_b = pre_l + (size_t)b * H * T * T;
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha_qk,
+                    K_b, 3*D, HD, Q_b, 3*D, HD,
+                    &beta0, S_b, T, (long long)T * T, H));
+            }
+            attention_softmax<<<B*H*T, 32, 0, stream>>>(attn_l, pre_l, B, H, T);
+            // Attn @ V
+            float alpha1 = 1.0f;
+            for (int b = 0; b < B; b++) {
+                const float *V_b    = qkv_l  + (size_t)b * T * 3 * D + 2 * D;
+                const float *attn_b = attn_l + (size_t)b * H * T * T;
+                float       *out_b  = out_l  + (size_t)b * T * D;
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha1,
+                    V_b, 3*D, HD, attn_b, T, (long long)T * T,
+                    &beta0, out_b, D, HD, H));
+            }
+        }
         if (fwd_ev) cudaEventRecord(fwd_ev[base + 2], stream);  // attn (qk+soft+av)
 
         matmul_forward(
@@ -823,21 +721,57 @@ static void model_backward(
             BT, D, D, cublas, stream);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 4], stream);  // memcpy + aproj
 
-        attention_dv<<<GRID(BTD), 0, stream>>>(
-            dacts[A_QKV] + l*BT3D, acts[A_ATTN] + l*BHTT,
-            dacts[A_ATTN_OUT] + l*BTD, B, T, H, D, HD);
-        attention_d_attn<<<GRID(BHTT), 0, stream>>>(
-            dacts[A_ATTN] + l*BHTT, acts[A_QKV] + l*BT3D,
-            dacts[A_ATTN_OUT] + l*BTD, B, T, H, D, HD);
-        attention_d_softmax<<<B*H*T, 32, 0, stream>>>(
-            dacts[A_ATTN_PRE] + l*BHTT, dacts[A_ATTN] + l*BHTT,
-            acts[A_ATTN] + l*BHTT, B, H, T);
-        attention_dq<<<GRID(BTD), 0, stream>>>(
-            dacts[A_QKV] + l*BT3D, dacts[A_ATTN_PRE] + l*BHTT,
-            acts[A_QKV] + l*BT3D, B, T, H, D, HD);
-        attention_dk<<<GRID(BTD), 0, stream>>>(
-            dacts[A_QKV] + l*BT3D, dacts[A_ATTN_PRE] + l*BHTT,
-            acts[A_QKV] + l*BT3D, B, T, H, D, HD);
+        // dV = Attn^T @ dO ;  dAttn = dO @ V^T
+        {
+            float alpha1 = 1.0f, beta0 = 0.0f;
+            float alpha_s = 1.0f / sqrtf((float)HD);
+            const float *qkv_l  = acts[A_QKV]       + (size_t)l * BT3D;
+            float       *dqkv_l = dacts[A_QKV]      + (size_t)l * BT3D;
+            const float *attn_l = acts[A_ATTN]      + (size_t)l * BHTT;
+            float       *dout_l = dacts[A_ATTN_OUT] + (size_t)l * BTD;
+            float       *dattn_l= dacts[A_ATTN]     + (size_t)l * BHTT;
+            float       *dpre_l = dacts[A_ATTN_PRE] + (size_t)l * BHTT;
+            for (int b = 0; b < B; b++) {
+                const float *Q_b    = qkv_l  + (size_t)b * T * 3 * D;
+                const float *K_b    = Q_b + D;
+                const float *V_b    = Q_b + 2 * D;
+                float       *dQ_b   = dqkv_l + (size_t)b * T * 3 * D;
+                float       *dK_b   = dQ_b + D;
+                float       *dV_b   = dQ_b + 2 * D;
+                const float *attn_b = attn_l  + (size_t)b * H * T * T;
+                float       *dO_b   = dout_l  + (size_t)b * T * D;
+                float       *dattn_b= dattn_l + (size_t)b * H * T * T;
+                float       *dpre_b = dpre_l  + (size_t)b * H * T * T;
+                // dV = Attn^T @ dO
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha1,
+                    dO_b, D, HD, attn_b, T, (long long)T * T,
+                    &beta0, dV_b, 3*D, HD, H));
+                // dAttn = dO @ V^T
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha1,
+                    V_b, 3*D, HD, dO_b, D, HD,
+                    &beta0, dattn_b, T, (long long)T * T, H));
+            }
+            attention_d_softmax<<<B*H*T, 32, 0, stream>>>(dpre_l, dattn_l, attn_l, B, H, T);
+            for (int b = 0; b < B; b++) {
+                const float *Q_b  = qkv_l  + (size_t)b * T * 3 * D;
+                const float *K_b  = Q_b + D;
+                float       *dQ_b = dqkv_l + (size_t)b * T * 3 * D;
+                float       *dK_b = dQ_b + D;
+                float       *dpre_b = dpre_l + (size_t)b * H * T * T;
+                // dQ = d_scores @ K * scale
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha_s,
+                    K_b, 3*D, HD, dpre_b, T, (long long)T * T,
+                    &beta0, dQ_b, 3*D, HD, H));
+                // dK = d_scores^T @ Q * scale
+                CHECK(cublasSgemmStridedBatched(cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha_s,
+                    Q_b, 3*D, HD, dpre_b, T, (long long)T * T,
+                    &beta0, dK_b, 3*D, HD, H));
+            }
+        }
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 5], stream);  // attn (dV+dA+dS+dQ+dK)
 
         matmul_backward(

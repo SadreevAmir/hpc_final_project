@@ -54,8 +54,7 @@
 // Standard 1-D launch config: 256 threads per block, enough blocks for n items.
 #define GRID(n) (((n) + 255) / 256), 256
 
-// Warp-level reductions across 32 lanes — used inside per-row kernels
-// (LayerNorm, softmax, attention softmax).
+// Warp-level reductions across 32 lanes.
 __device__ __forceinline__ float warp_sum(float v) {
     for (int off = 16; off > 0; off >>= 1)
         v += __shfl_xor_sync(0xffffffff, v, off);
@@ -67,60 +66,98 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+// =============================================================================
+// Fine-grained timing constants.
+//
+// model_forward records FWD_NEV CUDA events (one after each kernel group).
+// model_backward records BWD_NEV events.
+// Event arrays are allocated in main and passed to both functions.
+//
+// Forward layout (FKPL = 8 groups per layer):
+//   fwd_ev[0]           after encoder_forward
+//   fwd_ev[1+l*8 + 0]   after LN1          (layer l)
+//   fwd_ev[1+l*8 + 1]   after QKV matmul
+//   fwd_ev[1+l*8 + 2]   after attn (QK + softmax + AV)
+//   fwd_ev[1+l*8 + 3]   after attn-proj + residual1
+//   fwd_ev[1+l*8 + 4]   after LN2
+//   fwd_ev[1+l*8 + 5]   after FC1 matmul
+//   fwd_ev[1+l*8 + 6]   after GELU
+//   fwd_ev[1+l*8 + 7]   after FC2 matmul + residual2
+//   fwd_ev[1+L*8 + 0]   after final LNF
+//   fwd_ev[1+L*8 + 1]   after mean-pool
+//   fwd_ev[1+L*8 + 2]   after head matmul   (= last fwd event)
+//   (softmax_ce_forward is launched in main; ev_fwd records its end)
+//
+// Backward layout (BKPL = 8 groups per layer, reverse order i=L-1-l):
+//   bwd_ev[0]           after softmax_ce_backward
+//   bwd_ev[1]           after head matmul backward
+//   bwd_ev[2]           after mean-pool backward
+//   bwd_ev[3]           after final LNF backward
+//   bwd_ev[4+i*8 + 0]   after D2D-memcpy + FC2 backward   (iter i)
+//   bwd_ev[4+i*8 + 1]   after GELU backward
+//   bwd_ev[4+i*8 + 2]   after FC1 backward
+//   bwd_ev[4+i*8 + 3]   after LN2 backward
+//   bwd_ev[4+i*8 + 4]   after D2D-memcpy + attn-proj backward
+//   bwd_ev[4+i*8 + 5]   after attention backward (dV+dA+dS+dQ+dK)
+//   bwd_ev[4+i*8 + 6]   after QKV backward
+//   bwd_ev[4+i*8 + 7]   after LN1 backward
+//   bwd_ev[4+L*8]       after encoder backward
+// =============================================================================
+
+#define MAX_LAYERS 8
+#define FKPL       8
+#define BKPL       8
+#define FWD_NEV  (1 + MAX_LAYERS * FKPL + 3)
+#define BWD_NEV  (4 + MAX_LAYERS * BKPL + 1)
+
 // Model hyper-parameters.
 struct Cfg {
-    int vocab;     // V — number of distinct pixel intensities (256 for uint8)
-    int seq;       // T — sequence length (28*28)
-    int layers;    // L — number of transformer blocks
-    int dim;       // D — model hidden size
-    int heads;     // H — number of attention heads
+    int vocab;     // V
+    int seq;       // T
+    int layers;    // L
+    int dim;       // D
+    int heads;     // H
     int head_dim;  // D / H
-    int classes;   // C — number of output classes (10 for MNIST)
+    int classes;   // C
 };
 
 // =============================================================================
 // SECTION 1 — parameter and activation catalogs.
-//
-// All trainable parameters live in ONE flat device buffer of size sum(param_sizes).
-// `param_ptrs[i]` is the pointer at which tensor `i` begins inside that buffer.
-// Same scheme for activations and their gradients. This lets us reduce the
-// whole gradient blob with a single ncclAllReduce and run a single Adam kernel
-// over every parameter at once.
 // =============================================================================
 
 enum {
-    P_TOK_EMB,                // (V, D)        token (pixel intensity) embedding
-    P_POS_EMB,                // (T, D)        positional embedding
-    P_LN1_W, P_LN1_B,         // (L, D) each   first LayerNorm
-    P_QKV_W, P_QKV_B,         // (L, 3D, D) / (L, 3D)  Q/K/V linear (fused)
-    P_ATTPROJ_W, P_ATTPROJ_B, // (L, D, D)  / (L, D)   attention output projection
-    P_LN2_W, P_LN2_B,         // second LayerNorm
-    P_FC1_W, P_FC1_B,         // (L, 4D, D) / (L, 4D)  first MLP linear (D -> 4D)
-    P_FC2_W, P_FC2_B,         // (L, D, 4D) / (L, D)   second MLP linear (4D -> D)
-    P_LNF_W, P_LNF_B,         // final LayerNorm
-    P_HEAD,                   // (C, D)        classifier head
+    P_TOK_EMB,
+    P_POS_EMB,
+    P_LN1_W, P_LN1_B,
+    P_QKV_W, P_QKV_B,
+    P_ATTPROJ_W, P_ATTPROJ_B,
+    P_LN2_W, P_LN2_B,
+    P_FC1_W, P_FC1_B,
+    P_FC2_W, P_FC2_B,
+    P_LNF_W, P_LNF_B,
+    P_HEAD,
     NUM_PARAMS
 };
 
 enum {
-    A_ENCODED,                  // (B, T, D)        token+pos embedding sum
-    A_LNF, A_LNF_MEAN, A_LNF_RSTD,    // final LayerNorm output, stats
-    A_POOLED,                   // (B, D)           mean-pooled features
-    A_LOGITS,                   // (B, C)
-    A_PROBS,                    // (B, C)
-    A_LOSSES,                   // (B,)             per-sample loss
-    A_LN1, A_LN1_MEAN, A_LN1_RSTD,    // (L, B, T, D)   first LayerNorm
-    A_QKV,                      // (L, B, T, 3D)
-    A_ATTN_PRE,                 // (L, B, H, T, T)  pre-softmax scores
-    A_ATTN,                     // (L, B, H, T, T)  attention weights
-    A_ATTN_OUT,                 // (L, B, T, D)     attn @ V output
-    A_ATTPROJ,                  // (L, B, T, D)     attention output projection
-    A_RESID1,                   // (L, B, T, D)     after first residual
+    A_ENCODED,
+    A_LNF, A_LNF_MEAN, A_LNF_RSTD,
+    A_POOLED,
+    A_LOGITS,
+    A_PROBS,
+    A_LOSSES,
+    A_LN1, A_LN1_MEAN, A_LN1_RSTD,
+    A_QKV,
+    A_ATTN_PRE,
+    A_ATTN,
+    A_ATTN_OUT,
+    A_ATTPROJ,
+    A_RESID1,
     A_LN2, A_LN2_MEAN, A_LN2_RSTD,
-    A_FC1,                      // (L, B, T, 4D)    after first MLP linear
-    A_FC1_GELU,                 // (L, B, T, 4D)    after GELU
-    A_FC2,                      // (L, B, T, D)     after second MLP linear
-    A_RESID2,                   // (L, B, T, D)     after second residual
+    A_FC1,
+    A_FC1_GELU,
+    A_FC2,
+    A_RESID2,
     NUM_ACTS
 };
 
@@ -168,7 +205,6 @@ static void fill_act_sizes(size_t *sz, Cfg c, int B)
     sz[A_RESID2]    = L * B * T * D;
 }
 
-// Walk the flat buffer and hand out a pointer per slot.
 static void assign_pointers(float **ptrs, float *base, const size_t *sz, int n)
 {
     float *cur = base;
@@ -177,16 +213,8 @@ static void assign_pointers(float **ptrs, float *base, const size_t *sz, int n)
 
 // =============================================================================
 // SECTION 2 — kernels.
-//
-// Naming: `*_forward` writes to its output buffer with overwrite semantics;
-// `*_backward` either overwrites its dx buffer or accumulates with `+=` if the
-// downstream tensor receives gradient from more than one path (only LayerNorm
-// and the embedding scatter use accumulation).
 // =============================================================================
 
-// -----------------------------------------------------------------------------
-// Embedding: out[b, t, :] = wte[pixel[b, t]] + wpe[t].
-// -----------------------------------------------------------------------------
 __global__ void encoder_forward(
     float *out, const int *pixel, const float *wte, const float *wpe,
     int B, int T, int D)
@@ -200,8 +228,6 @@ __global__ void encoder_forward(
     out[i] = wte[tok * D + d] + wpe[t * D + d];
 }
 
-// Backward scatters dout into the embedding tables. Several positions may write
-// to the same row (same pixel value or same time index), so use atomicAdd.
 __global__ void encoder_backward(
     float *dwte, float *dwpe, const float *dout, const int *pixel,
     int B, int T, int D)
@@ -217,17 +243,6 @@ __global__ void encoder_backward(
     atomicAdd(&dwpe[t   * D + d], g);
 }
 
-// -----------------------------------------------------------------------------
-// LayerNorm over the last dimension (size D), per row.
-//
-//   mean[n] = mean_d(x[n, d])
-//   var[n]  = mean_d((x[n, d] - mean[n])^2)
-//   rstd[n] = 1 / sqrt(var[n] + eps)
-//   y[n, d] = (x[n, d] - mean[n]) * rstd[n] * gamma[d] + beta[d]
-//
-// Launched as <<<N, 32>>>: one warp per row. mean[] and rstd[] are saved for
-// backward.
-// -----------------------------------------------------------------------------
 __global__ void layernorm_forward(
     float *out, float *mean_out, float *rstd_out,
     const float *x, const float *gamma, const float *beta,
@@ -255,19 +270,6 @@ __global__ void layernorm_forward(
         row_y[d] = ((row_x[d] - mean) * rstd) * gamma[d] + beta[d];
 }
 
-// LayerNorm backward.
-//
-// Let x_hat = (x - mean) * rstd. Then
-//   dx_hat = dy * gamma
-//   dx     = rstd * (dx_hat - (mean(dx_hat) + x_hat * mean(dx_hat * x_hat)))
-//          = rstd * (dx_hat - (S1 + rstd^2 * (x - mean) * S2) / D)
-// with
-//   S1 = sum_d dx_hat[d]
-//   S2 = sum_d dx_hat[d] * (x[d] - mean[d])
-//
-// dx is *accumulated* (`+=`): the residual stream gradient is pre-loaded into
-// dx before this kernel runs, and we add the LN contribution on top of it.
-// dgamma and dbeta accumulate over all rows via atomicAdd.
 __global__ void layernorm_backward(
     float *dx, float *dgamma, float *dbeta,
     const float *dy, const float *x, const float *gamma,
@@ -296,7 +298,7 @@ __global__ void layernorm_backward(
         float dx_hat = row_dy[d] * gamma[d];
         float xc     = row_x[d] - mean;
         float dxd    = rstd * (dx_hat - (S1 + rstd * rstd * xc * S2) / (float)D);
-        row_dx[d] += dxd;                                   // accumulate
+        row_dx[d] += dxd;
     }
     for (int d = tid; d < D; d += 32) {
         atomicAdd(&dgamma[d], row_dy[d] * (row_x[d] - mean) * rstd);
@@ -304,11 +306,6 @@ __global__ void layernorm_backward(
     }
 }
 
-// -----------------------------------------------------------------------------
-// Bias broadcast for the linear layers.
-//   forward:  y[n, k] += b[k]
-//   backward: db[k] = sum_n dy[n, k]
-// -----------------------------------------------------------------------------
 __global__ void bias_add(float *y, const float *b, int N, int K)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -323,21 +320,12 @@ __global__ void bias_grad(float *db, const float *dy, int N, int K)
     db[k] = s;
 }
 
-// -----------------------------------------------------------------------------
-// Self-attention (bidirectional — no causal mask).
-//
-// qkv layout: [B, T, 3, H, head_dim] flattened. Within a position (b, t) the
-// first D floats are Q, next D are K, last D are V; within each, head h owns
-// floats [h*head_dim .. (h+1)*head_dim). The helper below extracts a pointer
-// to the (b, t, which ∈ {Q=0, K=1, V=2}, h) slice.
-// -----------------------------------------------------------------------------
 __device__ __forceinline__ size_t qkv_offset(
     int b, int t, int which, int h, int T, int D, int head_dim)
 {
     return ((size_t)b * T + t) * 3 * D + which * D + h * head_dim;
 }
 
-//   scores[b, h, t1, t2] = (Q[b, h, t1, :] . K[b, h, t2, :]) / sqrt(head_dim)
 __global__ void attention_qk(
     float *scores, const float *qkv,
     int B, int T, int H, int D, int head_dim)
@@ -356,7 +344,6 @@ __global__ void attention_qk(
     scores[i] = dot * rsqrtf((float)head_dim);
 }
 
-// One warp per (b, h, t1) row: softmax along the t2 axis (full T, no mask).
 __global__ void attention_softmax(
     float *attn, const float *scores, int B, int H, int T)
 {
@@ -378,7 +365,6 @@ __global__ void attention_softmax(
         attn_row[t] = expf(score_row[t] - mx) * inv;
 }
 
-//   out[b, t1, h*head_dim + d] = sum_t2 attn[b, h, t1, t2] * V[b, t2, h*head_dim + d]
 __global__ void attention_av(
     float *out, const float *attn, const float *qkv,
     int B, int T, int H, int D, int head_dim)
@@ -400,10 +386,6 @@ __global__ void attention_av(
     out[i] = sum;
 }
 
-// Attention backward. Five kernels, each is a direct application of the
-// chain rule. Notation: d_out = gradient of attn_av output.
-
-// dV[b, t2, hd] = sum_{t1} attn[b, h, t1, t2] * d_out[b, t1, hd]
 __global__ void attention_dv(
     float *dqkv, const float *attn, const float *d_out,
     int B, int T, int H, int D, int head_dim)
@@ -425,7 +407,6 @@ __global__ void attention_dv(
     dqkv[qkv_offset(b, t2, 2, h, T, D, head_dim) + di] = sum;
 }
 
-// d_attn[b, h, t1, t2] = sum_d V[b, t2, hd] * d_out[b, t1, hd]
 __global__ void attention_d_attn(
     float *d_attn, const float *qkv, const float *d_out,
     int B, int T, int H, int D, int head_dim)
@@ -446,8 +427,6 @@ __global__ void attention_d_attn(
     d_attn[i] = sum;
 }
 
-// Softmax backward, per (b, h, t1) row:
-//   d_scores[t2] = attn[t2] * (d_attn[t2] - sum_{j} attn[j] * d_attn[j])
 __global__ void attention_d_softmax(
     float *d_scores, const float *d_attn, const float *attn,
     int B, int H, int T)
@@ -466,7 +445,6 @@ __global__ void attention_d_softmax(
         out_row[t] = attn_row[t] * (d_attn_row[t] - s);
 }
 
-// dQ[b, t1, hd] = scale * sum_{t2} K[b, t2, hd] * d_scores[b, h, t1, t2]
 __global__ void attention_dq(
     float *dqkv, const float *d_scores, const float *qkv,
     int B, int T, int H, int D, int head_dim)
@@ -488,7 +466,6 @@ __global__ void attention_dq(
     dqkv[qkv_offset(b, t1, 0, h, T, D, head_dim) + di] = sum * rsqrtf((float)head_dim);
 }
 
-// dK[b, t2, hd] = scale * sum_{t1} Q[b, t1, hd] * d_scores[b, h, t1, t2]
 __global__ void attention_dk(
     float *dqkv, const float *d_scores, const float *qkv,
     int B, int T, int H, int D, int head_dim)
@@ -510,11 +487,7 @@ __global__ void attention_dk(
     dqkv[qkv_offset(b, t2, 1, h, T, D, head_dim) + di] = sum * rsqrtf((float)head_dim);
 }
 
-// -----------------------------------------------------------------------------
-// GELU activation, tanh approximation:
-//   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-// -----------------------------------------------------------------------------
-#define GELU_K 0.7978845608f      // sqrt(2 / pi)
+#define GELU_K 0.7978845608f
 
 __global__ void gelu_forward(float *out, const float *x, int n)
 {
@@ -535,23 +508,12 @@ __global__ void gelu_backward(float *dx, const float *dy, const float *x, int n)
     dx[i] = (0.5f * (1.0f + th) + 0.5f * xi * sech2 * darg) * dy[i];
 }
 
-// -----------------------------------------------------------------------------
-// Residual add: out = a + b. Backward is handled by the residual-stream pattern
-// (we cudaMemcpyAsync the incoming gradient onto the residual buffer before
-// each block-internal backward chain, and LayerNorm's `dx +=` adds the
-// block's contribution on top).
-// -----------------------------------------------------------------------------
 __global__ void residual_add(float *out, const float *a, const float *b, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
 
-// -----------------------------------------------------------------------------
-// Mean over the sequence (T) axis.
-//   forward:  out[b, d] = (1 / T) * sum_t x[b, t, d]
-//   backward: dx[b, t, d] = dy[b, d] / T   (broadcast over t)
-// -----------------------------------------------------------------------------
 __global__ void mean_pool_forward(float *out, const float *x, int B, int T, int D)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -571,11 +533,6 @@ __global__ void mean_pool_backward(float *dx, const float *dy, int B, int T, int
     dx[i] = dy[b * D + d] / (float)T;
 }
 
-// -----------------------------------------------------------------------------
-// Softmax + cross-entropy. One warp per sample.
-//   loss[b]  = logsumexp(logits[b, :]) - logits[b, target[b]]
-//   d_logits = probs - one_hot(target)
-// -----------------------------------------------------------------------------
 __global__ void softmax_ce_forward(
     float *probs, float *losses,
     const float *logits, const int *target,
@@ -610,13 +567,6 @@ __global__ void softmax_ce_backward(
     d_logits[i] = probs[i] - ((c == target[n]) ? 1.0f : 0.0f);
 }
 
-// -----------------------------------------------------------------------------
-// ADAM
-// scale = 1 / (B * world)  so that after NCCL allreduce the gradient is the
-// mean over the global batch.
-// -----------------------------------------------------------------------------
-// bc1 = 1 - beta1^step, bc2 = 1 - beta2^step — вычисляются на CPU
-// чтобы не дублировать powf() в каждой из total_params нитей.
 __global__ void adam_step(
     float *w, const float *g, float *m, float *v,
     int n, float lr, float beta1, float beta2, float eps,
@@ -632,9 +582,6 @@ __global__ void adam_step(
     w[i] -= lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
 }
 
-// -----------------------------------------------------------------------------
-// Reporting kernels (loss sum + top-1 accuracy counter).
-// -----------------------------------------------------------------------------
 __global__ void atomic_sum(float *out, const float *x, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -654,10 +601,6 @@ __global__ void count_correct(
 
 // =============================================================================
 // SECTION 3 — cuBLAS matmul wrappers.
-//
-// Convention: weights are row-major [out_features, in_features].
-// Forward:  y[N, OC] = x[N, C] @ w^T   (optionally + bias broadcast over rows).
-// Backward: writes dx, dw, db with overwrite semantics (beta = 0).
 // =============================================================================
 
 static void matmul_forward(
@@ -665,7 +608,6 @@ static void matmul_forward(
     int N, int C, int OC, cublasHandle_t cublas, cudaStream_t stream)
 {
     float alpha = 1.0f, beta = 0.0f;
-    // y(col-major OC x N) = w(col-major C x OC)^T * x(col-major C x N)
     CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                       OC, N, C,
                       &alpha, w, C, x, C,
@@ -680,7 +622,6 @@ static void matmul_backward(
 {
     float alpha = 1.0f, beta = 0.0f;
 
-    // dw(row-major OC x C) = dy^T(OC x N) * x(N x C).
     CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
                       C, OC, N,
                       &alpha, x, C, dy, OC,
@@ -688,7 +629,6 @@ static void matmul_backward(
 
     if (db) bias_grad<<<GRID(OC), 0, stream>>>(db, dy, N, OC);
 
-    // dx(row-major N x C) = dy(N x OC) * w(OC x C).
     CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                       C, N, OC,
                       &alpha, w, C, dy, OC,
@@ -698,14 +638,15 @@ static void matmul_backward(
 // =============================================================================
 // SECTION 4 — model forward and backward.
 //
-// `params[i]` / `acts[i]` are device pointers obtained from `assign_pointers`.
-// Per-layer tensors are addressed as `acts[A_QKV] + layer * stride_per_layer`.
+// fwd_ev / bwd_ev: if non-NULL, CUDA events are recorded after each kernel
+// group for fine-grained timing (see layout at top of file).
 // =============================================================================
 
 static void model_forward(
     float **params, float **acts, const int *pixel,
     Cfg c, int B,
-    cublasHandle_t cublas, cudaStream_t stream)
+    cublasHandle_t cublas, cudaStream_t stream,
+    cudaEvent_t *fwd_ev)
 {
     int T = c.seq, L = c.layers, D = c.dim, H = c.heads, HD = c.head_dim, C = c.classes;
     int BT       = B * T;
@@ -714,23 +655,26 @@ static void model_forward(
     int BT4D     = B * T * 4 * D;
     int BHTT     = B * H * T * T;
 
-    // Embed pixels.
     encoder_forward<<<GRID(BTD), 0, stream>>>(
         acts[A_ENCODED], pixel, params[P_TOK_EMB], params[P_POS_EMB], B, T, D);
+    if (fwd_ev) cudaEventRecord(fwd_ev[0], stream);  // 0: enc
 
-    // residual_in is the running residual-stream tensor through layers.
     const float *residual_in = acts[A_ENCODED];
 
     for (int l = 0; l < L; l++) {
+        int base = 1 + l * FKPL;
+
         // --- attention sub-block ---
         layernorm_forward<<<BT, 32, 0, stream>>>(
             acts[A_LN1] + l*BTD, acts[A_LN1_MEAN] + l*BT, acts[A_LN1_RSTD] + l*BT,
             residual_in, params[P_LN1_W] + l*D, params[P_LN1_B] + l*D, BT, D);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 0], stream);  // ln1
 
         matmul_forward(
             acts[A_QKV] + l*BT3D, acts[A_LN1] + l*BTD,
             params[P_QKV_W] + l*3*D*D, params[P_QKV_B] + l*3*D,
             BT, D, 3*D, cublas, stream);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 1], stream);  // qkv
 
         attention_qk<<<GRID(BHTT), 0, stream>>>(
             acts[A_ATTN_PRE] + l*BHTT, acts[A_QKV] + l*BT3D, B, T, H, D, HD);
@@ -739,67 +683,66 @@ static void model_forward(
         attention_av<<<GRID(BTD), 0, stream>>>(
             acts[A_ATTN_OUT] + l*BTD, acts[A_ATTN] + l*BHTT,
             acts[A_QKV] + l*BT3D, B, T, H, D, HD);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 2], stream);  // attn (qk+soft+av)
 
         matmul_forward(
             acts[A_ATTPROJ] + l*BTD, acts[A_ATTN_OUT] + l*BTD,
             params[P_ATTPROJ_W] + l*D*D, params[P_ATTPROJ_B] + l*D,
             BT, D, D, cublas, stream);
-
         residual_add<<<GRID(BTD), 0, stream>>>(
             acts[A_RESID1] + l*BTD, residual_in, acts[A_ATTPROJ] + l*BTD, BTD);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 3], stream);  // aproj + res1
 
         // --- MLP sub-block ---
         layernorm_forward<<<BT, 32, 0, stream>>>(
             acts[A_LN2] + l*BTD, acts[A_LN2_MEAN] + l*BT, acts[A_LN2_RSTD] + l*BT,
             acts[A_RESID1] + l*BTD, params[P_LN2_W] + l*D, params[P_LN2_B] + l*D, BT, D);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 4], stream);  // ln2
 
         matmul_forward(
             acts[A_FC1] + l*BT4D, acts[A_LN2] + l*BTD,
             params[P_FC1_W] + l*4*D*D, params[P_FC1_B] + l*4*D,
             BT, D, 4*D, cublas, stream);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 5], stream);  // fc1
 
         gelu_forward<<<GRID(BT4D), 0, stream>>>(
             acts[A_FC1_GELU] + l*BT4D, acts[A_FC1] + l*BT4D, BT4D);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 6], stream);  // gelu
 
         matmul_forward(
             acts[A_FC2] + l*BTD, acts[A_FC1_GELU] + l*BT4D,
             params[P_FC2_W] + l*D*4*D, params[P_FC2_B] + l*D,
             BT, 4*D, D, cublas, stream);
-
         residual_add<<<GRID(BTD), 0, stream>>>(
             acts[A_RESID2] + l*BTD, acts[A_RESID1] + l*BTD, acts[A_FC2] + l*BTD, BTD);
+        if (fwd_ev) cudaEventRecord(fwd_ev[base + 7], stream);  // fc2 + res2
 
         residual_in = acts[A_RESID2] + l*BTD;
     }
 
-    // Final LayerNorm + mean-pool + classifier head.
+    int fbase = 1 + L * FKPL;
+
     layernorm_forward<<<BT, 32, 0, stream>>>(
         acts[A_LNF], acts[A_LNF_MEAN], acts[A_LNF_RSTD],
         residual_in, params[P_LNF_W], params[P_LNF_B], BT, D);
+    if (fwd_ev) cudaEventRecord(fwd_ev[fbase + 0], stream);  // lnf
 
     mean_pool_forward<<<GRID(B * D), 0, stream>>>(
         acts[A_POOLED], acts[A_LNF], B, T, D);
+    if (fwd_ev) cudaEventRecord(fwd_ev[fbase + 1], stream);  // pool
 
     matmul_forward(
         acts[A_LOGITS], acts[A_POOLED], params[P_HEAD], NULL,
         B, D, C, cublas, stream);
+    if (fwd_ev) cudaEventRecord(fwd_ev[fbase + 2], stream);  // head
 }
 
-// Backward — must be called *after* the loss kernel has filled acts[A_PROBS]
-// (we re-use it). Walks the network in reverse, building gradients in the
-// matching d_* slots of `dacts`.
-//
-// Residual-stream pattern. Inside each block the input residual receives
-// gradient from two paths: the direct skip connection and the sub-block (LN
-// -> ... -> matmul). We start by copying the incoming residual gradient into
-// the residual buffer (cudaMemcpyAsync), then let LayerNorm's `dx +=` add the
-// sub-block contribution. After both sub-blocks, that buffer holds the full
-// gradient w.r.t. the block's input.
 static void model_backward(
     float **params, float **grads, float **acts, float **dacts,
     const int *pixel, const int *target,
     Cfg c, int B,
-    cublasHandle_t cublas, cudaStream_t stream)
+    cublasHandle_t cublas, cudaStream_t stream,
+    cudaEvent_t *bwd_ev)
 {
     int T = c.seq, L = c.layers, D = c.dim, H = c.heads, HD = c.head_dim, C = c.classes;
     int BT       = B * T;
@@ -808,35 +751,34 @@ static void model_backward(
     int BT4D     = B * T * 4 * D;
     int BHTT     = B * H * T * T;
 
-    // Loss backward.
     softmax_ce_backward<<<GRID(B * C), 0, stream>>>(
         dacts[A_LOGITS], acts[A_PROBS], target, B, C);
+    if (bwd_ev) cudaEventRecord(bwd_ev[0], stream);  // 0: loss_bwd
 
-    // Head linear.
     matmul_backward(
         dacts[A_POOLED], grads[P_HEAD], NULL,
         dacts[A_LOGITS], acts[A_POOLED], params[P_HEAD],
         B, D, C, cublas, stream);
+    if (bwd_ev) cudaEventRecord(bwd_ev[1], stream);  // 1: head_bwd
 
-    // Mean-pool fans the [B, D] gradient back into [B, T, D].
     mean_pool_backward<<<GRID(BTD), 0, stream>>>(dacts[A_LNF], dacts[A_POOLED], B, T, D);
+    if (bwd_ev) cudaEventRecord(bwd_ev[2], stream);  // 2: pool_bwd
 
-    // Final LayerNorm. Accumulates into dacts[A_RESID2 of last layer] which is
-    // zero at this point, so it ends up holding the full lnf-path gradient.
     layernorm_backward<<<BT, 32, 0, stream>>>(
         dacts[A_RESID2] + (L-1)*BTD,
         grads[P_LNF_W], grads[P_LNF_B], dacts[A_LNF],
         acts[A_RESID2] + (L-1)*BTD, params[P_LNF_W],
         acts[A_LNF_MEAN], acts[A_LNF_RSTD], BT, D);
+    if (bwd_ev) cudaEventRecord(bwd_ev[3], stream);  // 3: lnf_bwd
 
     for (int l = L - 1; l >= 0; l--) {
-        // Identify upstream residual: for layer l > 0 it is the previous block's
-        // residual2; for layer 0 it is the encoder output.
-        const float *upstream     = (l == 0) ? acts[A_ENCODED]   : acts[A_RESID2]  + (l-1)*BTD;
-        float       *d_upstream   = (l == 0) ? dacts[A_ENCODED]  : dacts[A_RESID2] + (l-1)*BTD;
+        int i    = L - 1 - l;       // iteration index (0, 1, ...)
+        int base = 4 + i * BKPL;
 
-        // Direct skip path: d_resid1 receives d_resid2; the MLP sub-block back
-        // pass will add its contribution.
+        const float *upstream   = (l == 0) ? acts[A_ENCODED]   : acts[A_RESID2]  + (l-1)*BTD;
+        float       *d_upstream = (l == 0) ? dacts[A_ENCODED]  : dacts[A_RESID2] + (l-1)*BTD;
+
+        // Skip path: copy resid2 gradient into resid1 before MLP backward.
         CHECK(cudaMemcpyAsync(
             dacts[A_RESID1] + l*BTD, dacts[A_RESID2] + l*BTD,
             BTD * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -847,23 +789,27 @@ static void model_backward(
             dacts[A_RESID2] + l*BTD, acts[A_FC1_GELU] + l*BT4D,
             params[P_FC2_W] + l*D*4*D,
             BT, 4*D, D, cublas, stream);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 0], stream);  // memcpy + fc2
 
         gelu_backward<<<GRID(BT4D), 0, stream>>>(
             dacts[A_FC1] + l*BT4D, dacts[A_FC1_GELU] + l*BT4D,
             acts[A_FC1] + l*BT4D, BT4D);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 1], stream);  // gelu
 
         matmul_backward(
             dacts[A_LN2] + l*BTD, grads[P_FC1_W] + l*4*D*D, grads[P_FC1_B] + l*4*D,
             dacts[A_FC1] + l*BT4D, acts[A_LN2] + l*BTD, params[P_FC1_W] + l*4*D*D,
             BT, D, 4*D, cublas, stream);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 2], stream);  // fc1
 
         layernorm_backward<<<BT, 32, 0, stream>>>(
             dacts[A_RESID1] + l*BTD,
             grads[P_LN2_W] + l*D, grads[P_LN2_B] + l*D, dacts[A_LN2] + l*BTD,
             acts[A_RESID1] + l*BTD, params[P_LN2_W] + l*D,
             acts[A_LN2_MEAN] + l*BT, acts[A_LN2_RSTD] + l*BT, BT, D);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 3], stream);  // ln2
 
-        // Direct skip path for the attention sub-block.
+        // Skip path: copy resid1 gradient to upstream before attention backward.
         CHECK(cudaMemcpyAsync(
             d_upstream, dacts[A_RESID1] + l*BTD,
             BTD * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -875,6 +821,7 @@ static void model_backward(
             dacts[A_RESID1] + l*BTD, acts[A_ATTN_OUT] + l*BTD,
             params[P_ATTPROJ_W] + l*D*D,
             BT, D, D, cublas, stream);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 4], stream);  // memcpy + aproj
 
         attention_dv<<<GRID(BTD), 0, stream>>>(
             dacts[A_QKV] + l*BT3D, acts[A_ATTN] + l*BHTT,
@@ -891,6 +838,7 @@ static void model_backward(
         attention_dk<<<GRID(BTD), 0, stream>>>(
             dacts[A_QKV] + l*BT3D, dacts[A_ATTN_PRE] + l*BHTT,
             acts[A_QKV] + l*BT3D, B, T, H, D, HD);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 5], stream);  // attn (dV+dA+dS+dQ+dK)
 
         matmul_backward(
             dacts[A_LN1] + l*BTD,
@@ -898,40 +846,39 @@ static void model_backward(
             dacts[A_QKV] + l*BT3D, acts[A_LN1] + l*BTD,
             params[P_QKV_W] + l*3*D*D,
             BT, D, 3*D, cublas, stream);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 6], stream);  // qkv
 
         layernorm_backward<<<BT, 32, 0, stream>>>(
             d_upstream,
             grads[P_LN1_W] + l*D, grads[P_LN1_B] + l*D, dacts[A_LN1] + l*BTD,
             upstream, params[P_LN1_W] + l*D,
             acts[A_LN1_MEAN] + l*BT, acts[A_LN1_RSTD] + l*BT, BT, D);
+        if (bwd_ev) cudaEventRecord(bwd_ev[base + 7], stream);  // ln1
     }
 
-    // Embedding backward — scatter dacts[A_ENCODED] into wte and wpe.
     encoder_backward<<<GRID(BTD), 0, stream>>>(
         grads[P_TOK_EMB], grads[P_POS_EMB], dacts[A_ENCODED], pixel, B, T, D);
+    if (bwd_ev) cudaEventRecord(bwd_ev[4 + L * BKPL], stream);  // enc_bwd
 }
 
 // =============================================================================
 // SECTION 5 — initialisation and data loading.
 // =============================================================================
 
-// Init weights as N(0, 0.02), biases as 0, LayerNorm gammas as 1.
-// Same RNG seed on every rank so all GPUs start from identical parameters
-// without needing an MPI_Bcast.
 static void init_parameters(
     float *d_params, const size_t *sizes, size_t total, unsigned seed)
 {
     enum { WEIGHT, BIAS, LN_GAMMA };
     static const int kind[NUM_PARAMS] = {
-        WEIGHT, WEIGHT,                   // tok_emb, pos_emb
-        LN_GAMMA, BIAS,                   // ln1_w, ln1_b
-        WEIGHT, BIAS,                     // qkv_w, qkv_b
-        WEIGHT, BIAS,                     // attproj_w, attproj_b
-        LN_GAMMA, BIAS,                   // ln2_w, ln2_b
-        WEIGHT, BIAS,                     // fc1_w, fc1_b
-        WEIGHT, BIAS,                     // fc2_w, fc2_b
-        LN_GAMMA, BIAS,                   // lnf_w, lnf_b
-        WEIGHT                            // head
+        WEIGHT, WEIGHT,
+        LN_GAMMA, BIAS,
+        WEIGHT, BIAS,
+        WEIGHT, BIAS,
+        LN_GAMMA, BIAS,
+        WEIGHT, BIAS,
+        WEIGHT, BIAS,
+        LN_GAMMA, BIAS,
+        WEIGHT
     };
 
     std::mt19937 rng(seed);
@@ -951,20 +898,18 @@ static void init_parameters(
                      cudaMemcpyHostToDevice));
 }
 
-// Reads the Kaggle "digit-recognizer" CSV layout: header row, then
-// `label, pixel0, pixel1, ..., pixel783` per sample.
 static int load_mnist_csv(
     const char *path, std::vector<uint8_t> &pixels, std::vector<int> &labels)
 {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     static char line[8192];
-    fgets(line, sizeof(line), f);                       // header
+    fgets(line, sizeof(line), f);
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         labels.push_back((int)strtol(p, &p, 10));
         for (int i = 0; i < 784; i++) {
-            p++;                                         // skip comma
+            p++;
             pixels.push_back((uint8_t)strtol(p, &p, 10));
         }
     }
@@ -978,7 +923,6 @@ static int load_mnist_csv(
 
 int main(int argc, char **argv)
 {
-    // MPI / CUDA / cuBLAS / NCCL bootstrap.
     int provided;
     CHECK(MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided));
     int rank, world;
@@ -1002,7 +946,6 @@ int main(int argc, char **argv)
     ncclComm_t nccl;
     CHECK(ncclCommInitRank(&nccl, world, nccl_id, rank));
 
-    // Arguments.
     const char *csv_path = (argc > 1) ? argv[1] : "data/train.csv";
     int   steps          = (argc > 2) ? atoi(argv[2]) : 200;
     int   B              = (argc > 3) ? atoi(argv[3]) : 8;
@@ -1013,7 +956,6 @@ int main(int argc, char **argv)
                 /*classes*/ 10 };
     int BT = B * cfg.seq;
 
-    // Load MNIST on every rank (data fits in RAM trivially).
     std::vector<uint8_t> pixels;
     std::vector<int>     labels;
     int N = load_mnist_csv(csv_path, pixels, labels);
@@ -1022,7 +964,6 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Compute total sizes and allocate flat buffers.
     size_t param_sz[NUM_PARAMS], act_sz[NUM_ACTS];
     fill_param_sizes(param_sz, cfg);
     fill_act_sizes(act_sz, cfg, B);
@@ -1052,7 +993,6 @@ int main(int argc, char **argv)
 
     init_parameters(d_params, param_sz, total_params, /*seed*/ 42);
 
-    // Input/target staging buffers (pinned host + device).
     int *d_pixel, *d_target;
     int *h_pixel, *h_target;
     CHECK(cudaMalloc(&d_pixel,  BT * sizeof(int)));
@@ -1060,7 +1000,6 @@ int main(int argc, char **argv)
     CHECK(cudaMallocHost(&h_pixel,  BT * sizeof(int)));
     CHECK(cudaMallocHost(&h_target, B  * sizeof(int)));
 
-    // Small scalars used only for reporting.
     float *d_loss_sum; int *d_correct;
     CHECK(cudaMalloc(&d_loss_sum, sizeof(float)));
     CHECK(cudaMalloc(&d_correct,  sizeof(int)));
@@ -1073,19 +1012,7 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    FILE *log_fp = NULL;
-    if (rank == 0) {
-        log_fp = fopen("training_log.csv", "w");
-        if (log_fp) {
-            fprintf(log_fp, "step,elapsed_s,loss,accuracy,t_h2d_ms,t_fwd_ms,t_bwd_ms,t_nccl_ms,t_adam_ms\n");
-            fflush(log_fp);
-        }
-    }
-
-    // Each rank samples its own random batches.
-    std::mt19937 rng(42 + 1000u * rank);
-    std::uniform_int_distribution<int> sampler(0, N - 1);
-
+    // ---- coarse CUDA events ----
     cudaEvent_t ev_step0, ev_h2d, ev_fwd, ev_bwd, ev_nccl, ev_adam;
     CHECK(cudaEventCreate(&ev_step0));
     CHECK(cudaEventCreate(&ev_h2d));
@@ -1094,16 +1021,59 @@ int main(int argc, char **argv)
     CHECK(cudaEventCreate(&ev_nccl));
     CHECK(cudaEventCreate(&ev_adam));
 
+    // ---- fine-grained per-kernel event arrays ----
+    cudaEvent_t fwd_ev[FWD_NEV], bwd_ev[BWD_NEV];
+    for (int i = 0; i < FWD_NEV; i++) CHECK(cudaEventCreate(&fwd_ev[i]));
+    for (int i = 0; i < BWD_NEV; i++) CHECK(cudaEventCreate(&bwd_ev[i]));
+
+    FILE *log_fp = NULL;
+    if (rank == 0) {
+        log_fp = fopen("training_log.csv", "w");
+        if (log_fp) {
+            // Coarse columns
+            fprintf(log_fp,
+                "step,elapsed_s,loss,accuracy,"
+                "t_h2d_ms,t_fwd_ms,t_bwd_ms,t_nccl_ms,t_adam_ms,"
+                "tf_enc");
+            // Fine forward: per layer
+            for (int l = 0; l < cfg.layers; l++)
+                fprintf(log_fp,
+                    ",tf_l%d_ln1,tf_l%d_qkv,tf_l%d_attn,"
+                    "tf_l%d_aproj,tf_l%d_ln2,tf_l%d_fc1,"
+                    "tf_l%d_gelu,tf_l%d_fc2",
+                    l,l,l, l,l,l, l,l);
+            // Fine forward: tail
+            fprintf(log_fp, ",tf_lnf,tf_pool,tf_head,tf_loss");
+            // Fine backward: head
+            fprintf(log_fp, ",tb_loss,tb_head,tb_pool,tb_lnf");
+            // Fine backward: per layer (printed in reverse-iteration order)
+            for (int i = 0; i < cfg.layers; i++) {
+                int l = cfg.layers - 1 - i;
+                fprintf(log_fp,
+                    ",tb_l%d_fc2,tb_l%d_gelu,tb_l%d_fc1,"
+                    "tb_l%d_ln2,tb_l%d_aproj,tb_l%d_attn,"
+                    "tb_l%d_qkv,tb_l%d_ln1",
+                    l,l,l, l,l,l, l,l);
+            }
+            // Fine backward: encoder
+            fprintf(log_fp, ",tb_enc\n");
+            fflush(log_fp);
+        }
+    }
+
+    std::mt19937 rng(42 + 1000u * rank);
+    std::uniform_int_distribution<int> sampler(0, N - 1);
+
     auto t_start = std::chrono::steady_clock::now();
 
     for (int step = 1; step <= steps; step++) {
-        // Sample a batch on the host, then async-copy to device.
         for (int b = 0; b < B; b++) {
             int j = sampler(rng);
             h_target[b] = labels[j];
             for (int t = 0; t < cfg.seq; t++)
                 h_pixel[b*cfg.seq + t] = (int)pixels[(size_t)j*cfg.seq + t];
         }
+
         cudaEventRecord(ev_step0, stream);
         CHECK(cudaMemcpyAsync(d_pixel,  h_pixel,  BT*sizeof(int),
                               cudaMemcpyHostToDevice, stream));
@@ -1111,26 +1081,23 @@ int main(int argc, char **argv)
                               cudaMemcpyHostToDevice, stream));
         cudaEventRecord(ev_h2d, stream);
 
-        // Zero gradient buffers (param-grads accumulate via atomicAdd for some
-        // tensors; activation-grads are partly accumulated via residual stream).
         CHECK(cudaMemsetAsync(d_grads, 0, total_params * sizeof(float), stream));
         CHECK(cudaMemsetAsync(d_dacts, 0, total_acts   * sizeof(float), stream));
 
-        model_forward(params, acts, d_pixel, cfg, B, cublas, stream);
+        model_forward(params, acts, d_pixel, cfg, B, cublas, stream, fwd_ev);
         softmax_ce_forward<<<B, 32, 0, stream>>>(
             acts[A_PROBS], acts[A_LOSSES], acts[A_LOGITS], d_target, B, cfg.classes);
         cudaEventRecord(ev_fwd, stream);
+
         model_backward(params, grads, acts, dacts,
-                       d_pixel, d_target, cfg, B, cublas, stream);
+                       d_pixel, d_target, cfg, B, cublas, stream, bwd_ev);
         cudaEventRecord(ev_bwd, stream);
 
-        // Reduce gradients across ranks (no-op for world == 1).
         if (world > 1)
             CHECK(ncclAllReduce(d_grads, d_grads, total_params,
                                 ncclFloat, ncclSum, nccl, stream));
         cudaEventRecord(ev_nccl, stream);
 
-        // Adam over the entire flat parameter buffer in one launch.
         float scale = 1.0f / (float)(B * world);
         float bc1   = 1.0f - powf(0.9f,   (float)step);
         float bc2   = 1.0f - powf(0.999f, (float)step);
@@ -1139,7 +1106,6 @@ int main(int argc, char **argv)
             (int)total_params, lr, 0.9f, 0.999f, 1e-8f, scale, bc1, bc2);
         cudaEventRecord(ev_adam, stream);
 
-        // Periodic loss + accuracy.
         if (step % 10 == 0 || step == steps) {
             CHECK(cudaMemsetAsync(d_loss_sum, 0, sizeof(float), stream));
             CHECK(cudaMemsetAsync(d_correct,  0, sizeof(int),   stream));
@@ -1153,12 +1119,35 @@ int main(int argc, char **argv)
                                   cudaMemcpyDeviceToHost, stream));
             CHECK(cudaStreamSynchronize(stream));
 
-            float t_h2d_ms = 0, t_fwd_ms = 0, t_bwd_ms = 0, t_nccl_ms = 0, t_adam_ms = 0;
+            // ---- coarse timings ----
+            float t_h2d_ms = 0, t_fwd_ms = 0, t_bwd_ms = 0,
+                  t_nccl_ms = 0, t_adam_ms = 0;
             cudaEventElapsedTime(&t_h2d_ms,  ev_step0, ev_h2d);
             cudaEventElapsedTime(&t_fwd_ms,  ev_h2d,   ev_fwd);
             cudaEventElapsedTime(&t_bwd_ms,  ev_fwd,   ev_bwd);
             cudaEventElapsedTime(&t_nccl_ms, ev_bwd,   ev_nccl);
             cudaEventElapsedTime(&t_adam_ms, ev_nccl,  ev_adam);
+
+            // ---- fine forward timings ----
+            // tf[0]   : ev_h2d  -> fwd_ev[0]         (encoder)
+            // tf[k]   : fwd_ev[k-1] -> fwd_ev[k]     (k = 1 .. fwd_nev_used-1)
+            // tf_loss : fwd_ev[last] -> ev_fwd        (softmax_ce_forward in main)
+            int fwd_nev_used = 1 + cfg.layers * FKPL + 3;
+            float tf[FWD_NEV] = {};
+            cudaEventElapsedTime(&tf[0], ev_h2d, fwd_ev[0]);
+            for (int k = 1; k < fwd_nev_used; k++)
+                cudaEventElapsedTime(&tf[k], fwd_ev[k-1], fwd_ev[k]);
+            float tf_loss = 0.0f;
+            cudaEventElapsedTime(&tf_loss, fwd_ev[fwd_nev_used - 1], ev_fwd);
+
+            // ---- fine backward timings ----
+            // tb[0]   : ev_fwd     -> bwd_ev[0]       (softmax_ce_backward)
+            // tb[k]   : bwd_ev[k-1] -> bwd_ev[k]      (k = 1 .. bwd_nev_used-1)
+            int bwd_nev_used = 4 + cfg.layers * BKPL + 1;
+            float tb[BWD_NEV] = {};
+            cudaEventElapsedTime(&tb[0], ev_fwd, bwd_ev[0]);
+            for (int k = 1; k < bwd_nev_used; k++)
+                cudaEventElapsedTime(&tb[k], bwd_ev[k-1], bwd_ev[k]);
 
             float mean_loss   = h_loss / B;
             int   global_corr = h_corr, global_n = B;
@@ -1169,22 +1158,51 @@ int main(int argc, char **argv)
             MPI_Allreduce(MPI_IN_PLACE, &global_n,    1, MPI_INT,
                           MPI_SUM, MPI_COMM_WORLD);
             mean_loss /= world;
+
             if (rank == 0) {
                 double el = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
-                printf("step %4d | loss %.4f | acc %.3f | h2d %.2fms fwd %.2fms bwd %.2fms nccl %.2fms adam %.2fms\n",
+
+                printf("step %4d | loss %.4f | acc %.3f | "
+                       "h2d %.2f fwd %.2f bwd %.2f nccl %.2f adam %.2f ms\n",
                        step, mean_loss, (float)global_corr / global_n,
                        t_h2d_ms, t_fwd_ms, t_bwd_ms, t_nccl_ms, t_adam_ms);
+
                 if (log_fp) {
-                    fprintf(log_fp, "%d,%.2f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    // coarse
+                    fprintf(log_fp, "%d,%.2f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f",
                             step, el, mean_loss,
                             (float)global_corr / global_n,
                             t_h2d_ms, t_fwd_ms, t_bwd_ms, t_nccl_ms, t_adam_ms);
+                    // fine forward: enc
+                    fprintf(log_fp, ",%.3f", tf[0]);
+                    // fine forward: per layer
+                    for (int l = 0; l < cfg.layers; l++) {
+                        int base = 1 + l * FKPL;
+                        for (int k = 0; k < FKPL; k++)
+                            fprintf(log_fp, ",%.3f", tf[base + k]);
+                    }
+                    // fine forward: tail (lnf, pool, head, loss)
+                    int fbase = 1 + cfg.layers * FKPL;
+                    fprintf(log_fp, ",%.3f,%.3f,%.3f,%.3f",
+                            tf[fbase], tf[fbase+1], tf[fbase+2], tf_loss);
+                    // fine backward: fixed head (loss, head, pool, lnf)
+                    for (int k = 0; k < 4; k++)
+                        fprintf(log_fp, ",%.3f", tb[k]);
+                    // fine backward: per layer (stored in reverse-iteration order)
+                    for (int i = 0; i < cfg.layers; i++) {
+                        int base = 4 + i * BKPL;
+                        for (int k = 0; k < BKPL; k++)
+                            fprintf(log_fp, ",%.3f", tb[base + k]);
+                    }
+                    // fine backward: encoder
+                    fprintf(log_fp, ",%.3f\n", tb[4 + cfg.layers * BKPL]);
                     fflush(log_fp);
                 }
             }
         }
     }
+
     CHECK(cudaStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
     auto t_end = std::chrono::steady_clock::now();
@@ -1198,13 +1216,18 @@ int main(int argc, char **argv)
     }
 
     if (log_fp) fclose(log_fp);
+
     cudaEventDestroy(ev_step0); cudaEventDestroy(ev_h2d);
     cudaEventDestroy(ev_fwd);   cudaEventDestroy(ev_bwd);
     cudaEventDestroy(ev_nccl);  cudaEventDestroy(ev_adam);
+    for (int i = 0; i < FWD_NEV; i++) cudaEventDestroy(fwd_ev[i]);
+    for (int i = 0; i < BWD_NEV; i++) cudaEventDestroy(bwd_ev[i]);
+
     cudaFreeHost(h_pixel); cudaFreeHost(h_target);
     cudaFree(d_pixel);     cudaFree(d_target);
     cudaFree(d_acts);      cudaFree(d_dacts);
-    cudaFree(d_params);    cudaFree(d_grads); cudaFree(d_momentum); cudaFree(d_velocity);
+    cudaFree(d_params);    cudaFree(d_grads);
+    cudaFree(d_momentum);  cudaFree(d_velocity);
     cudaFree(d_loss_sum);  cudaFree(d_correct);
     ncclCommDestroy(nccl);
     cublasDestroy(cublas);

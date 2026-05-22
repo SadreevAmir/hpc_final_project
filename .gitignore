@@ -14,3 +14,5 @@ pcie*.png
 nccl*.png
 roofline.png
 timing*.png
+hbm*.png
+timing_kernels*.png

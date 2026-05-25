@@ -1,9 +1,96 @@
 # Отчёт по оптимизациям CUDA-версии train_vit
 
-Дата: 2026-05-24
+Дата: 2026-05-25
 Файл: [src/train_vit.cu](src/train_vit.cu)
 Сборка локально не проверена (нет nvcc на macOS). **Собирать и тестировать на
 Kaggle через [kaggle_run.ipynb](kaggle_run.ipynb).**
+
+## Runtime feature flags (новое)
+
+Каждое из 4 нововведений теперь **отключаемо отдельной env-переменной** без
+пересборки. По умолчанию все = 1 (новый/быстрый путь). Старый код сохранён
+рядом и активируется флагом = 0.
+
+| Env var | Что переключает | Default |
+|---|---|---|
+| `PERF_LN_BWD_FAST=0/1` | layernorm_backward: register-accumulators (1) vs warp-per-row + atomicAdd-per-row (0) | 1 |
+| `PERF_SGEMV_BIAS=0/1` | bias_grad: cublasSgemv (1) vs serial 1-thread-per-column kernel (0) | 1 |
+| `PERF_ATTN_BATCHED=0/1` | attention matmuls: cublasSgemmBatched (1) vs per-b cublasSgemmStridedBatched loop (0) | 1 |
+| `PERF_NARROW_MEMSET=0/1` | per-step memset: ~1 MB targeted (1) vs ~350 MB full d_dacts (0) | 1 |
+
+Запуск с конкретным фиксом отключённым:
+
+```bash
+# отключить только LN bwd fast, остальные включены
+PERF_LN_BWD_FAST=0 ./bin/train_vit data/train.csv 200 8 0.001
+
+# отключить всё (полный legacy)
+PERF_LN_BWD_FAST=0 PERF_SGEMV_BIAS=0 PERF_ATTN_BATCHED=0 PERF_NARROW_MEMSET=0 \
+  ./bin/train_vit data/train.csv 200 8 0.001
+```
+
+В stdout первой строкой печатается текущая конфигурация флагов, например:
+
+```
+perf flags: LN_BWD_FAST=1 SGEMV_BIAS=1 ATTN_BATCHED=1 NARROW_MEMSET=1
+```
+
+## Тайминги для измерения каждого фикса
+
+В `training_log.csv` (и в stdout) есть колонки для оценки эффекта каждого фикса
+по отдельности:
+
+| Фикс | Колонки CSV для оценки | Прямота |
+|---|---|---|
+| **#1 LN bwd** | `tb_l0_ln1, tb_l0_ln2, tb_l1_ln1, tb_l1_ln2, tb_lnf` | прямо |
+| **#2 bias_grad** | `tb_l0_qkv, tb_l0_aproj, tb_l0_fc1, tb_l0_fc2` (и l1) | косвенно — bias_grad внутри matmul_backward, его время растворено в общем тайминге matmul-bwd |
+| **#3 attn batched** | `tf_l0_attn, tf_l1_attn, tb_l0_attn, tb_l1_attn` | прямо |
+| **#4 narrow memset** | `t_zero_ms` (новая колонка, отдельный coarse-таймер) | прямо |
+
+**Новое:** добавлен event `ev_zero` между memset и forward; теперь:
+
+- `t_h2d_ms` — копирование пикселей host→device
+- `t_zero_ms` — **только memset** (изолирован от forward)
+- `t_fwd_ms` — forward kernels (без memset)
+- `t_bwd_ms`, `t_nccl_ms`, `t_adam_ms` — без изменений
+
+**Внимание при сравнении со старыми логами:** в старых логах `tf_enc` (первая
+колонка тонкого fwd-тайминга) включал memset; теперь он чистый encoder fwd.
+Аналогично `t_fwd_ms` стал меньше за счёт выноса memset.
+
+### Что НЕ покрыто инструментально
+
+`bias_grad` нельзя замерить **изолированно** — он сидит внутри `matmul_backward`
+между двумя GEMM-вызовами. Чтобы получить чистый таймер, нужно было бы
+добавить event внутри `matmul_backward` (3 события на вызов вместо 1). Сейчас
+оценка идёт через **A/B сравнение `tb_l*_qkv/aproj/fc1/fc2`** при
+`PERF_SGEMV_BIAS=1` vs `=0`. Самый показательный — `tb_l*_fc1` (там K=4D=256,
+самый «толстый» bias).
+
+## Методика бенча: A/B по флагам
+
+Чтобы понять вклад каждого фикса:
+
+```bash
+# baseline (всё старое)
+PERF_LN_BWD_FAST=0 PERF_SGEMV_BIAS=0 PERF_ATTN_BATCHED=0 PERF_NARROW_MEMSET=0 \
+  ./bin/train_vit data/train.csv 50 8 0.001
+mv training_log.csv training_log_baseline.csv
+
+# +#1 LN bwd
+PERF_LN_BWD_FAST=1 PERF_SGEMV_BIAS=0 PERF_ATTN_BATCHED=0 PERF_NARROW_MEMSET=0 \
+  ./bin/train_vit data/train.csv 50 8 0.001
+mv training_log.csv training_log_ln.csv
+
+# +#1 +#2
+PERF_LN_BWD_FAST=1 PERF_SGEMV_BIAS=1 PERF_ATTN_BATCHED=0 PERF_NARROW_MEMSET=0 \
+  ./bin/train_vit data/train.csv 50 8 0.001
+mv training_log.csv training_log_ln_bias.csv
+
+# и т.д.
+```
+
+Сравнивать колонки попарно — увидишь дельту по каждому фиксу отдельно.
 
 ## Что было сделано
 

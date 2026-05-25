@@ -66,6 +66,20 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+// File-scope helpers populated in main():
+//   g_ones        : device vector [BT] of 1.0f, used as the summation vector
+//                   in the cublasSgemv path that replaced bias_grad.
+//   g_attn_ptrs   : device array of float* for cublasSgemmBatched attention.
+//                   Layout: 12 sections of size (L * B * H), one per matrix
+//                   role (Q, K, V, S, A, O, dQ, dK, dV, dS, dA, dO).
+static float  *g_ones      = NULL;
+static float **g_attn_ptrs = NULL;
+enum {
+    PT_Q = 0, PT_K, PT_V, PT_S, PT_A, PT_O,
+    PT_dQ,    PT_dK, PT_dV, PT_dS, PT_dA, PT_dO,
+    PT_COUNT
+};
+
 // =============================================================================
 // Fine-grained timing constants.
 //
@@ -270,55 +284,78 @@ __global__ void layernorm_forward(
         row_y[d] = ((row_x[d] - mean) * rstd) * gamma[d] + beta[d];
 }
 
+// One warp per block, but each block processes `rows_per_block` rows and keeps
+// per-thread register accumulators for dgamma/dbeta. At the end of the block,
+// we flush exactly ONE atomicAdd per (block, d) instead of one per (row, d).
+// For BT=6272 rows with rows_per_block=32 that cuts atomic contention on the
+// 64-slot dgamma/dbeta arrays from 6272 to 196 atomics per slot (~32x).
+//
+// `dx` is still accumulated (+=) because it feeds the residual path that was
+// prefilled by an upstream cudaMemcpyAsync. D is assumed <= 256 (8 register
+// slots per thread with 32 threads).
+#define LN_ACC_MAX 8
+
 __global__ void layernorm_backward(
     float *dx, float *dgamma, float *dbeta,
     const float *dy, const float *x, const float *gamma,
     const float *mean_buf, const float *rstd_buf,
-    int N, int D)
+    int N, int D, int rows_per_block)
 {
-    int n = blockIdx.x;
     int tid = threadIdx.x;
-    const float *row_x  = x  + (size_t)n * D;
-    const float *row_dy = dy + (size_t)n * D;
-    float       *row_dx = dx + (size_t)n * D;
-    float mean = mean_buf[n];
-    float rstd = rstd_buf[n];
+    int row_start = blockIdx.x * rows_per_block;
+    int row_end   = row_start + rows_per_block;
+    if (row_end > N) row_end = N;
 
-    float S1 = 0.0f, S2 = 0.0f;
-    for (int d = tid; d < D; d += 32) {
-        float dx_hat = row_dy[d] * gamma[d];
-        float xc     = row_x[d] - mean;
-        S1 += dx_hat;
-        S2 += dx_hat * xc;
-    }
-    S1 = warp_sum(S1);
-    S2 = warp_sum(S2);
+    float dg_acc[LN_ACC_MAX] = {0,0,0,0,0,0,0,0};
+    float db_acc[LN_ACC_MAX] = {0,0,0,0,0,0,0,0};
 
-    for (int d = tid; d < D; d += 32) {
-        float dx_hat = row_dy[d] * gamma[d];
-        float xc     = row_x[d] - mean;
-        float dxd    = rstd * (dx_hat - (S1 + rstd * rstd * xc * S2) / (float)D);
-        row_dx[d] += dxd;
+    for (int n = row_start; n < row_end; n++) {
+        const float *row_x  = x  + (size_t)n * D;
+        const float *row_dy = dy + (size_t)n * D;
+        float       *row_dx = dx + (size_t)n * D;
+        float mean = mean_buf[n];
+        float rstd = rstd_buf[n];
+
+        float S1 = 0.0f, S2 = 0.0f;
+        for (int d = tid; d < D; d += 32) {
+            float dx_hat = row_dy[d] * gamma[d];
+            float xc     = row_x[d] - mean;
+            S1 += dx_hat;
+            S2 += dx_hat * xc;
+        }
+        S1 = warp_sum(S1);
+        S2 = warp_sum(S2);
+
+        int slot = 0;
+        for (int d = tid; d < D; d += 32) {
+            float dx_hat = row_dy[d] * gamma[d];
+            float xc     = row_x[d] - mean;
+            float dxd    = rstd * (dx_hat - (S1 + rstd * rstd * xc * S2) / (float)D);
+            row_dx[d] += dxd;
+            dg_acc[slot] += row_dy[d] * xc * rstd;
+            db_acc[slot] += row_dy[d];
+            slot++;
+        }
     }
+
+    int slot = 0;
     for (int d = tid; d < D; d += 32) {
-        atomicAdd(&dgamma[d], row_dy[d] * (row_x[d] - mean) * rstd);
-        atomicAdd(&dbeta[d],  row_dy[d]);
+        atomicAdd(&dgamma[d], dg_acc[slot]);
+        atomicAdd(&dbeta[d],  db_acc[slot]);
+        slot++;
     }
 }
+
+#define LN_ROWS_PER_BLOCK 32
+#define LN_BWD_GRID(N) (((N) + LN_ROWS_PER_BLOCK - 1) / LN_ROWS_PER_BLOCK)
 
 __global__ void bias_add(float *y, const float *b, int N, int K)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N * K) y[i] += b[i % K];
 }
-__global__ void bias_grad(float *db, const float *dy, int N, int K)
-{
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= K) return;
-    float s = 0.0f;
-    for (int n = 0; n < N; n++) s += dy[(size_t)n * K + k];
-    db[k] = s;
-}
+// Note: the old bias_grad kernel (1-thread-per-column, serial reduction over N)
+// has been replaced by a cublasSgemv call inside matmul_backward. See [perf].
 
 __global__ void attention_softmax(
     float *attn, const float *scores, int B, int H, int T)
@@ -501,7 +538,15 @@ static void matmul_backward(
                       &alpha, x, C, dy, OC,
                       &beta,  dw, C));
 
-    if (db) bias_grad<<<GRID(OC), 0, stream>>>(db, dy, N, OC);
+    // bias_grad via cublasSgemv. dy is logically [N, OC] row-major; cuBLAS
+    // sees it as a column-major [OC, N] matrix with lda=OC, so
+    // db = dy_cublas @ ones reduces along N. Massively faster than the old
+    // 1-thread-per-column serial kernel: cuBLAS picks a coalesced tiled GEMV.
+    if (db) {
+        CHECK(cublasSgemv(cublas, CUBLAS_OP_N, OC, N,
+                          &alpha, dy, OC, g_ones, 1,
+                          &beta,  db, 1));
+    }
 
     CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                       C, N, OC,
@@ -550,36 +595,29 @@ static void model_forward(
             BT, D, 3*D, cublas, stream);
         if (fwd_ev) cudaEventRecord(fwd_ev[base + 1], stream);  // qkv
 
-        // Q @ K^T  (cublasSgemmStridedBatched per batch element, H heads each)
-        // Layout: Q[b,h] = qkv + b*T*3D + h*HD  — col-major [HD,T] lda=3D stride=HD
-        //         S[b,h] = scores + b*H*T*T      — [T,T] ldc=T strideC=T*T
+        // Q @ K^T and Attn @ V via cublasSgemmBatched (batchCount = B*H).
+        // Pointer arrays g_attn_ptrs are populated once in main(), so this
+        // collapses 2*B cuBLAS launches (here: 16 at B=8) into 2.
         {
-            float alpha_qk = 1.0f / sqrtf((float)HD), beta0 = 0.0f;
-            float       *qkv_l = acts[A_QKV]      + (size_t)l * BT3D;
-            float       *pre_l = acts[A_ATTN_PRE] + (size_t)l * BHTT;
+            float alpha_qk = 1.0f / sqrtf((float)HD), beta0 = 0.0f, alpha1 = 1.0f;
+            int   LBH = c.layers * B * H, BH = B * H;
             float       *attn_l= acts[A_ATTN]     + (size_t)l * BHTT;
-            float       *out_l = acts[A_ATTN_OUT] + (size_t)l * BTD;
-            for (int b = 0; b < B; b++) {
-                const float *Q_b = qkv_l + (size_t)b * T * 3 * D;
-                const float *K_b = Q_b + D;
-                float       *S_b = pre_l + (size_t)b * H * T * T;
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha_qk,
-                    K_b, 3*D, HD, Q_b, 3*D, HD,
-                    &beta0, S_b, T, (long long)T * T, H));
-            }
+            float       *pre_l = acts[A_ATTN_PRE] + (size_t)l * BHTT;
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha_qk,
+                (const float* const*)(g_attn_ptrs + PT_K * LBH + l * BH), 3*D,
+                (const float* const*)(g_attn_ptrs + PT_Q * LBH + l * BH), 3*D,
+                &beta0,
+                g_attn_ptrs + PT_S * LBH + l * BH, T,
+                BH));
             attention_softmax<<<B*H*T, 32, 0, stream>>>(attn_l, pre_l, B, H, T);
-            // Attn @ V
-            float alpha1 = 1.0f;
-            for (int b = 0; b < B; b++) {
-                const float *V_b    = qkv_l  + (size_t)b * T * 3 * D + 2 * D;
-                const float *attn_b = attn_l + (size_t)b * H * T * T;
-                float       *out_b  = out_l  + (size_t)b * T * D;
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha1,
-                    V_b, 3*D, HD, attn_b, T, (long long)T * T,
-                    &beta0, out_b, D, HD, H));
-            }
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha1,
+                (const float* const*)(g_attn_ptrs + PT_V * LBH + l * BH), 3*D,
+                (const float* const*)(g_attn_ptrs + PT_A * LBH + l * BH), T,
+                &beta0,
+                g_attn_ptrs + PT_O * LBH + l * BH, D,
+                BH));
         }
         if (fwd_ev) cudaEventRecord(fwd_ev[base + 2], stream);  // attn (qk+soft+av)
 
@@ -662,11 +700,11 @@ static void model_backward(
     mean_pool_backward<<<GRID(BTD), 0, stream>>>(dacts[A_LNF], dacts[A_POOLED], B, T, D);
     if (bwd_ev) cudaEventRecord(bwd_ev[2], stream);  // 2: pool_bwd
 
-    layernorm_backward<<<BT, 32, 0, stream>>>(
+    layernorm_backward<<<LN_BWD_GRID(BT), 32, 0, stream>>>(
         dacts[A_RESID2] + (L-1)*BTD,
         grads[P_LNF_W], grads[P_LNF_B], dacts[A_LNF],
         acts[A_RESID2] + (L-1)*BTD, params[P_LNF_W],
-        acts[A_LNF_MEAN], acts[A_LNF_RSTD], BT, D);
+        acts[A_LNF_MEAN], acts[A_LNF_RSTD], BT, D, LN_ROWS_PER_BLOCK);
     if (bwd_ev) cudaEventRecord(bwd_ev[3], stream);  // 3: lnf_bwd
 
     for (int l = L - 1; l >= 0; l--) {
@@ -700,11 +738,11 @@ static void model_backward(
             BT, D, 4*D, cublas, stream);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 2], stream);  // fc1
 
-        layernorm_backward<<<BT, 32, 0, stream>>>(
+        layernorm_backward<<<LN_BWD_GRID(BT), 32, 0, stream>>>(
             dacts[A_RESID1] + l*BTD,
             grads[P_LN2_W] + l*D, grads[P_LN2_B] + l*D, dacts[A_LN2] + l*BTD,
             acts[A_RESID1] + l*BTD, params[P_LN2_W] + l*D,
-            acts[A_LN2_MEAN] + l*BT, acts[A_LN2_RSTD] + l*BT, BT, D);
+            acts[A_LN2_MEAN] + l*BT, acts[A_LN2_RSTD] + l*BT, BT, D, LN_ROWS_PER_BLOCK);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 3], stream);  // ln2
 
         // Skip path: copy resid1 gradient to upstream before attention backward.
@@ -721,56 +759,48 @@ static void model_backward(
             BT, D, D, cublas, stream);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 4], stream);  // memcpy + aproj
 
-        // dV = Attn^T @ dO ;  dAttn = dO @ V^T
+        // dV, dAttn, dQ, dK via cublasSgemmBatched (batchCount = B*H).
+        // Collapses 4*B launches (32 at B=8) into 4.
         {
             float alpha1 = 1.0f, beta0 = 0.0f;
             float alpha_s = 1.0f / sqrtf((float)HD);
-            const float *qkv_l  = acts[A_QKV]       + (size_t)l * BT3D;
-            float       *dqkv_l = dacts[A_QKV]      + (size_t)l * BT3D;
+            int   LBH = c.layers * B * H, BH = B * H;
             const float *attn_l = acts[A_ATTN]      + (size_t)l * BHTT;
-            float       *dout_l = dacts[A_ATTN_OUT] + (size_t)l * BTD;
             float       *dattn_l= dacts[A_ATTN]     + (size_t)l * BHTT;
             float       *dpre_l = dacts[A_ATTN_PRE] + (size_t)l * BHTT;
-            for (int b = 0; b < B; b++) {
-                const float *Q_b    = qkv_l  + (size_t)b * T * 3 * D;
-                const float *K_b    = Q_b + D;
-                const float *V_b    = Q_b + 2 * D;
-                float       *dQ_b   = dqkv_l + (size_t)b * T * 3 * D;
-                float       *dK_b   = dQ_b + D;
-                float       *dV_b   = dQ_b + 2 * D;
-                const float *attn_b = attn_l  + (size_t)b * H * T * T;
-                float       *dO_b   = dout_l  + (size_t)b * T * D;
-                float       *dattn_b= dattn_l + (size_t)b * H * T * T;
-                float       *dpre_b = dpre_l  + (size_t)b * H * T * T;
-                // dV = Attn^T @ dO
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha1,
-                    dO_b, D, HD, attn_b, T, (long long)T * T,
-                    &beta0, dV_b, 3*D, HD, H));
-                // dAttn = dO @ V^T
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha1,
-                    V_b, 3*D, HD, dO_b, D, HD,
-                    &beta0, dattn_b, T, (long long)T * T, H));
-            }
+            // dV = Attn^T @ dO
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha1,
+                (const float* const*)(g_attn_ptrs + PT_dO * LBH + l * BH), D,
+                (const float* const*)(g_attn_ptrs + PT_A  * LBH + l * BH), T,
+                &beta0,
+                g_attn_ptrs + PT_dV * LBH + l * BH, 3*D,
+                BH));
+            // dAttn = dO @ V^T
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N, T, T, HD, &alpha1,
+                (const float* const*)(g_attn_ptrs + PT_V  * LBH + l * BH), 3*D,
+                (const float* const*)(g_attn_ptrs + PT_dO * LBH + l * BH), D,
+                &beta0,
+                g_attn_ptrs + PT_dA * LBH + l * BH, T,
+                BH));
             attention_d_softmax<<<B*H*T, 32, 0, stream>>>(dpre_l, dattn_l, attn_l, B, H, T);
-            for (int b = 0; b < B; b++) {
-                const float *Q_b  = qkv_l  + (size_t)b * T * 3 * D;
-                const float *K_b  = Q_b + D;
-                float       *dQ_b = dqkv_l + (size_t)b * T * 3 * D;
-                float       *dK_b = dQ_b + D;
-                float       *dpre_b = dpre_l + (size_t)b * H * T * T;
-                // dQ = d_scores @ K * scale
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha_s,
-                    K_b, 3*D, HD, dpre_b, T, (long long)T * T,
-                    &beta0, dQ_b, 3*D, HD, H));
-                // dK = d_scores^T @ Q * scale
-                CHECK(cublasSgemmStridedBatched(cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha_s,
-                    Q_b, 3*D, HD, dpre_b, T, (long long)T * T,
-                    &beta0, dK_b, 3*D, HD, H));
-            }
+            // dQ = d_scores @ K * scale
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_N, CUBLAS_OP_N, HD, T, T, &alpha_s,
+                (const float* const*)(g_attn_ptrs + PT_K  * LBH + l * BH), 3*D,
+                (const float* const*)(g_attn_ptrs + PT_dS * LBH + l * BH), T,
+                &beta0,
+                g_attn_ptrs + PT_dQ * LBH + l * BH, 3*D,
+                BH));
+            // dK = d_scores^T @ Q * scale
+            CHECK(cublasSgemmBatched(cublas,
+                CUBLAS_OP_N, CUBLAS_OP_T, HD, T, T, &alpha_s,
+                (const float* const*)(g_attn_ptrs + PT_Q  * LBH + l * BH), 3*D,
+                (const float* const*)(g_attn_ptrs + PT_dS * LBH + l * BH), T,
+                &beta0,
+                g_attn_ptrs + PT_dK * LBH + l * BH, 3*D,
+                BH));
         }
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 5], stream);  // attn (dV+dA+dS+dQ+dK)
 
@@ -782,11 +812,11 @@ static void model_backward(
             BT, D, 3*D, cublas, stream);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 6], stream);  // qkv
 
-        layernorm_backward<<<BT, 32, 0, stream>>>(
+        layernorm_backward<<<LN_BWD_GRID(BT), 32, 0, stream>>>(
             d_upstream,
             grads[P_LN1_W] + l*D, grads[P_LN1_B] + l*D, dacts[A_LN1] + l*BTD,
             upstream, params[P_LN1_W] + l*D,
-            acts[A_LN1_MEAN] + l*BT, acts[A_LN1_RSTD] + l*BT, BT, D);
+            acts[A_LN1_MEAN] + l*BT, acts[A_LN1_RSTD] + l*BT, BT, D, LN_ROWS_PER_BLOCK);
         if (bwd_ev) cudaEventRecord(bwd_ev[base + 7], stream);  // ln1
     }
 
@@ -927,6 +957,66 @@ int main(int argc, char **argv)
 
     init_parameters(d_params, param_sz, total_params, /*seed*/ 42);
 
+    // -------------------------------------------------------------------------
+    // PERF: bias_grad replacement support.
+    // g_ones[BT] is the constant 1.0f vector used by cublasSgemv inside
+    // matmul_backward (replaces the old serial bias_grad kernel).
+    CHECK(cudaMalloc(&g_ones, BT * sizeof(float)));
+    {
+        std::vector<float> tmp(BT, 1.0f);
+        CHECK(cudaMemcpy(g_ones, tmp.data(), BT * sizeof(float),
+                         cudaMemcpyHostToDevice));
+    }
+
+    // -------------------------------------------------------------------------
+    // PERF: precompute pointer arrays for cublasSgemmBatched in attention.
+    // Layout: 12 sections of size L*B*H, indexed by PT_* enum.
+    {
+        int H  = cfg.heads;
+        int HD = cfg.head_dim;
+        int T  = cfg.seq;
+        int Dd = cfg.dim;
+        int LBH = cfg.layers * B * H;
+        size_t total_ptrs = (size_t)PT_COUNT * LBH;
+        CHECK(cudaMalloc(&g_attn_ptrs, total_ptrs * sizeof(float*)));
+        std::vector<float*> h_ptrs(total_ptrs);
+        for (int l = 0; l < cfg.layers; l++) {
+            float *qkv_l   = acts[A_QKV]       + (size_t)l * B * T * 3 * Dd;
+            float *dqkv_l  = dacts[A_QKV]      + (size_t)l * B * T * 3 * Dd;
+            float *pre_l   = acts[A_ATTN_PRE]  + (size_t)l * B * H * T * T;
+            float *attn_l  = acts[A_ATTN]      + (size_t)l * B * H * T * T;
+            float *out_l   = acts[A_ATTN_OUT]  + (size_t)l * B * T * Dd;
+            float *dpre_l  = dacts[A_ATTN_PRE] + (size_t)l * B * H * T * T;
+            float *dattn_l = dacts[A_ATTN]     + (size_t)l * B * H * T * T;
+            float *dout_l  = dacts[A_ATTN_OUT] + (size_t)l * B * T * Dd;
+            for (int b = 0; b < B; b++) {
+                for (int h = 0; h < H; h++) {
+                    int idx = (l * B + b) * H + h;
+                    size_t bT3D = (size_t)b * T * 3 * Dd;
+                    size_t bHTT = (size_t)b * H * T * T;
+                    size_t bTD  = (size_t)b * T * Dd;
+                    int hHD = h * HD;
+                    int hTT = h * T * T;
+                    h_ptrs[(size_t)PT_Q  * LBH + idx] = qkv_l   + bT3D + hHD;
+                    h_ptrs[(size_t)PT_K  * LBH + idx] = qkv_l   + bT3D + Dd + hHD;
+                    h_ptrs[(size_t)PT_V  * LBH + idx] = qkv_l   + bT3D + 2*Dd + hHD;
+                    h_ptrs[(size_t)PT_S  * LBH + idx] = pre_l   + bHTT + hTT;
+                    h_ptrs[(size_t)PT_A  * LBH + idx] = attn_l  + bHTT + hTT;
+                    h_ptrs[(size_t)PT_O  * LBH + idx] = out_l   + bTD  + hHD;
+                    h_ptrs[(size_t)PT_dQ * LBH + idx] = dqkv_l  + bT3D + hHD;
+                    h_ptrs[(size_t)PT_dK * LBH + idx] = dqkv_l  + bT3D + Dd + hHD;
+                    h_ptrs[(size_t)PT_dV * LBH + idx] = dqkv_l  + bT3D + 2*Dd + hHD;
+                    h_ptrs[(size_t)PT_dS * LBH + idx] = dpre_l  + bHTT + hTT;
+                    h_ptrs[(size_t)PT_dA * LBH + idx] = dattn_l + bHTT + hTT;
+                    h_ptrs[(size_t)PT_dO * LBH + idx] = dout_l  + bTD  + hHD;
+                }
+            }
+        }
+        CHECK(cudaMemcpy(g_attn_ptrs, h_ptrs.data(),
+                         total_ptrs * sizeof(float*),
+                         cudaMemcpyHostToDevice));
+    }
+
     int *d_pixel, *d_target;
     int *h_pixel, *h_target;
     CHECK(cudaMalloc(&d_pixel,  BT * sizeof(int)));
@@ -1015,8 +1105,23 @@ int main(int argc, char **argv)
                               cudaMemcpyHostToDevice, stream));
         cudaEventRecord(ev_h2d, stream);
 
+        // PERF: zero only what backward reads-then-accumulates:
+        //   - d_grads (~167k floats): encoder_backward and layernorm_backward
+        //     accumulate via atomicAdd into dwte/dwpe/dgamma/dbeta.
+        //   - dacts[A_RESID2] + (L-1)*BTD: the LNF backward writes `dx +=`
+        //     into this slice, and unlike the other RESID slices it isn't
+        //     prefilled by a cudaMemcpyAsync upstream.
+        // All other dacts are written with `=` (matmul_backward beta=0,
+        // gelu_backward, mean_pool_backward, softmax_ce_backward) or are
+        // prefilled by the D2D memcpy that copies RESID2→RESID1 / RESID1→upstream.
+        // Old code zeroed the full ~350 MB d_dacts buffer every step;
+        // new code zeroes ~1 MB.
         CHECK(cudaMemsetAsync(d_grads, 0, total_params * sizeof(float), stream));
-        CHECK(cudaMemsetAsync(d_dacts, 0, total_acts   * sizeof(float), stream));
+        CHECK(cudaMemsetAsync(
+            dacts[A_RESID2] + (size_t)(cfg.layers - 1) * B * cfg.seq * cfg.dim,
+            0,
+            (size_t)B * cfg.seq * cfg.dim * sizeof(float),
+            stream));
 
         model_forward(params, acts, d_pixel, cfg, B, cublas, stream, fwd_ev);
         softmax_ce_forward<<<B, 32, 0, stream>>>(
@@ -1163,6 +1268,7 @@ int main(int argc, char **argv)
     cudaFree(d_params);    cudaFree(d_grads);
     cudaFree(d_momentum);  cudaFree(d_velocity);
     cudaFree(d_loss_sum);  cudaFree(d_correct);
+    cudaFree(g_ones);      cudaFree(g_attn_ptrs);
     ncclCommDestroy(nccl);
     cublasDestroy(cublas);
     cudaStreamDestroy(stream);

@@ -1081,7 +1081,11 @@ int main(int argc, char **argv)
         const char *v = getenv(name);
         return v ? atoi(v) : dflt;
     };
-    g_use_ln_bwd_fast   = read_flag("PERF_LN_BWD_FAST",   1);
+    // LN_BWD_FAST disabled by default: in measurements on T4 the
+    // register-accumulator path did not improve real performance
+    // (likely occupancy regression from register pressure). Code kept
+    // around for the historical A/B record but off by default.
+    g_use_ln_bwd_fast   = read_flag("PERF_LN_BWD_FAST",   0);
     g_use_sgemv_bias    = read_flag("PERF_SGEMV_BIAS",    1);
     g_use_attn_batched  = read_flag("PERF_ATTN_BATCHED",  1);
     g_use_narrow_memset = read_flag("PERF_NARROW_MEMSET", 1);

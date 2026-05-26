@@ -5,6 +5,12 @@
 Сборка локально не проверена (нет nvcc на macOS). **Собирать и тестировать на
 Kaggle через [kaggle_run.ipynb](kaggle_run.ipynb).**
 
+> **Update 2026-05-26.** Фикс #1 (`PERF_LN_BWD_FAST`) **отключён по умолчанию**.
+> В замерах на T4 register-accumulator путь **не дал реального ускорения**
+> (вероятно, регрессия occupancy из-за давления на регистры). Код оставлен в
+> бинарнике для исторического A/B, но в default-конфиге не используется.
+> **Дальше речь идёт о трёх фиксах**, а не о четырёх.
+
 ## Runtime feature flags (новое)
 
 Каждое из 4 нововведений теперь **отключаемо отдельной env-переменной** без
@@ -13,7 +19,7 @@ Kaggle через [kaggle_run.ipynb](kaggle_run.ipynb).**
 
 | Env var | Что переключает | Default |
 |---|---|---|
-| `PERF_LN_BWD_FAST=0/1` | layernorm_backward: register-accumulators (1) vs warp-per-row + atomicAdd-per-row (0) | 1 |
+| `PERF_LN_BWD_FAST=0/1` | layernorm_backward: register-accumulators (1) vs warp-per-row + atomicAdd-per-row (0). **Shelved** — оставлен `=0` по умолчанию. | 0 |
 | `PERF_SGEMV_BIAS=0/1` | bias_grad: cublasSgemv (1) vs serial 1-thread-per-column kernel (0) | 1 |
 | `PERF_ATTN_BATCHED=0/1` | attention matmuls: cublasSgemmBatched (1) vs per-b cublasSgemmStridedBatched loop (0) | 1 |
 | `PERF_NARROW_MEMSET=0/1` | per-step memset: ~1 MB targeted (1) vs ~350 MB full d_dacts (0) | 1 |
@@ -32,7 +38,7 @@ PERF_LN_BWD_FAST=0 PERF_SGEMV_BIAS=0 PERF_ATTN_BATCHED=0 PERF_NARROW_MEMSET=0 \
 В stdout первой строкой печатается текущая конфигурация флагов, например:
 
 ```
-perf flags: LN_BWD_FAST=1 SGEMV_BIAS=1 ATTN_BATCHED=1 NARROW_MEMSET=1
+perf flags: LN_BWD_FAST=0 SGEMV_BIAS=1 ATTN_BATCHED=1 NARROW_MEMSET=1
 ```
 
 ## Тайминги для измерения каждого фикса
@@ -98,7 +104,7 @@ mv training_log.csv training_log_ln_bias.csv
 [perf_notes.md](perf_notes.md). Фокус — backward, потому что по старым
 запускам именно там разрыв с PyTorch.
 
-### 1. `layernorm_backward` — register-accumulators, 32 строки на блок
+### 1. `layernorm_backward` — register-accumulators, 32 строки на блок (**SHELVED, default=0**)
 
 **Файл:** [train_vit.cu:287-350](src/train_vit.cu#L287-L350)
 
@@ -231,13 +237,13 @@ Indexing: `g_attn_ptrs[PT_X * LBH + (l*B + b)*H + h]`.
 
 ## Ожидаемый суммарный эффект
 
-| Фикс | Экономия (оценка) |
-|---|---|
-| #1 layernorm_backward atomics | 0.8–2 мс/шаг |
-| #2 bias_grad → cublasSgemv | 0.4–1.2 мс/шаг |
-| #3 attention batched (fwd+bwd) | ~0.9 мс/шаг |
-| #4 memset d_dacts | 1–2 мс/шаг + меньше L2-trash |
-| **Итого** | **~3-6 мс/шаг** |
+| Фикс | Экономия (оценка) | Статус |
+|---|---|---|
+| ~~#1 layernorm_backward atomics~~ | ~~0.8–2 мс/шаг~~ | **shelved (default=0)** — на T4 эффекта не дал |
+| #2 bias_grad → cublasSgemv | 0.4–1.2 мс/шаг | активен |
+| #3 attention batched (fwd+bwd) | ~0.9 мс/шаг | активен |
+| #4 memset d_dacts | 1–2 мс/шаг + меньше L2-trash | активен |
+| **Итого по трём активным** | **~2–4 мс/шаг** | |
 
 Это должно **закрыть разрыв с PyTorch и, скорее всего, обогнать его** на
 T4 при B=8-32 (PyTorch с `SDPBackend.MATH` без flash-attention).
